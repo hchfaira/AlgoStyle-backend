@@ -1,0 +1,66 @@
+"""
+AlgoStyle Backend — FastAPI Server
+===================================
+Mobile-first API gateway for the Fashion AI recommendation engine.
+Wraps the LLM_project services and exposes mobile-friendly endpoints.
+"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import os
+
+from config import settings
+from routes import auth, onboarding, wardrobe, recommendation, chat, tryon, outfit, explain, image_consulting
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle events."""
+    print("🚀 AlgoStyle API starting...")
+    yield
+    print("👋 AlgoStyle API shutting down...")
+
+
+app = FastAPI(
+    title="AlgoStyle — Fashion AI",
+    description="Mobile API for AI-powered fashion recommendations",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# CORS middleware - environment-aware configuration
+cors_origins = settings.get_cors_origins()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=settings.cors_credentials,
+    allow_methods=settings.cors_methods,
+    allow_headers=settings.cors_headers,
+)
+
+print(f"🔒 CORS enabled for: {cors_origins} (Environment: {settings.environment})")
+
+# Mount routes
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(onboarding.router, prefix="/api/v1/onboarding", tags=["Onboarding"])
+app.include_router(wardrobe.router, prefix="/api/v1/wardrobe", tags=["Wardrobe"])
+app.include_router(recommendation.router, prefix="/api/v1/recommend", tags=["Recommendations"])
+app.include_router(explain.router, prefix="/api/v1/recommend", tags=["Recommendations"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
+app.include_router(tryon.router, prefix="/api/v1/tryon", tags=["Try-On"])
+app.include_router(outfit.router)
+app.include_router(image_consulting.router, prefix="/api/v1/image-consulting", tags=["Image Consulting"])
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "0.1.0", "service": "algostyle"}
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "AlgoStyle — Fashion AI API",
+        "docs": "/docs",
+        "version": "0.1.0",
+    }

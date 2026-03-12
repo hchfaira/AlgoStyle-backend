@@ -1,0 +1,746 @@
+{
+  "info": {
+    "name": "AlgoStyle Fashion AI API",
+    "description": "Mobile-first API gateway for the Fashion AI recommendation engine",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health & Root",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            }
+          }
+        },
+        {
+          "name": "Root Endpoint",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": ["{{base_url}}"],
+              "path": [""]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Register User",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\",\n  \"name\": \"John Doe\",\n  \"role\": \"user\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/register",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "register"]
+            }
+          }
+        },
+        {
+          "name": "Login User",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/login",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "login"]
+            }
+          }
+        },
+        {
+          "name": "Guest Login",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/guest",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "guest"]
+            }
+          }
+        },
+        {
+          "name": "Get Current User",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/me?token={{auth_token}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "me"],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{auth_token}}"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding",
+      "item": [
+        {
+          "name": "Get Profile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/onboarding/profile/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "onboarding", "profile", "{{user_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Jane Doe\",\n  \"height_cm\": 170,\n  \"weight_kg\": 65,\n  \"style_preferences\": [\"minimalist\", \"classic\"],\n  \"budget\": \"mid\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/onboarding/profile/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "onboarding", "profile", "{{user_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Analyze Body Photo",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": ""
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/onboarding/analyze-photo/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "onboarding", "analyze-photo", "{{user_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Complete Onboarding",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/onboarding/complete/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "onboarding", "complete", "{{user_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wardrobe",
+      "item": [
+        {
+          "name": "Add Garment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": ""
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items?user_id={{user_id}}&category=tops",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                },
+                {
+                  "key": "category",
+                  "value": "tops"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Garments",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items?user_id={{user_id}}&category=tops&color=blue&season=summer&formality=casual&pattern=solid&is_favorite=false&for_sale=false&search=",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                },
+                {
+                  "key": "category",
+                  "value": "tops"
+                },
+                {
+                  "key": "color",
+                  "value": "blue"
+                },
+                {
+                  "key": "season",
+                  "value": "summer"
+                },
+                {
+                  "key": "formality",
+                  "value": "casual"
+                },
+                {
+                  "key": "pattern",
+                  "value": "solid"
+                },
+                {
+                  "key": "is_favorite",
+                  "value": "false"
+                },
+                {
+                  "key": "for_sale",
+                  "value": "false"
+                },
+                {
+                  "key": "search",
+                  "value": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Garment",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items/{{garment_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items", "{{garment_id}}"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update Garment",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"color_primary\": \"navy\",\n  \"brand\": \"Nike\",\n  \"purchase_price\": 89.99\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items/{{garment_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items", "{{garment_id}}"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Garment",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items/{{garment_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items", "{{garment_id}}"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Toggle Favorite",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items/{{garment_id}}/favorite?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items", "{{garment_id}}", "favorite"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Toggle For Sale",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/items/{{garment_id}}/for-sale?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "items", "{{garment_id}}", "for-sale"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wardrobe Stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/stats?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "stats"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Smart Suggestions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/smart-suggestions?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "smart-suggestions"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Closet Audit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/wardrobe/audit?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "wardrobe", "audit"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Recommendations",
+      "item": [
+        {
+          "name": "Get Recommendations",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"occasion\": \"work\",\n  \"weather\": \"sunny\",\n  \"season\": \"summer\",\n  \"max_recommendations\": 5,\n  \"scoring_profile\": \"balanced\",\n  \"exclude_garments\": [],\n  \"force_items\": []\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/recommend/outfits",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "recommend", "outfits"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Explain Outfit",
+      "item": [
+        {
+          "name": "Explain Outfit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"outfit\": {\n    \"id\": \"outfit_1\",\n    \"garments\": [\n      {\n        \"id\": \"garment_1\",\n        \"category\": \"tops\",\n        \"attributes\": {\n          \"color_primary\": \"blue\",\n          \"formality\": \"business\"\n        }\n      }\n    ],\n    \"score\": {\n      \"overall\": 0.85,\n      \"color_harmony\": 0.90,\n      \"formality_match\": 0.80,\n      \"occasion_fit\": 0.85,\n      \"pattern_mixing\": 0.80,\n      \"proportion\": 0.85,\n      \"season_fit\": 0.80,\n      \"creativity\": 0.75\n    }\n  },\n  \"occasion\": \"work\",\n  \"scoring_profile\": \"balanced\",\n  \"detail_level\": \"detailed\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/recommend/explain",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "recommend", "explain"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat",
+      "item": [
+        {
+          "name": "Start Session",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/start-session?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "chat", "start-session"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send Message",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"message\": \"What should I wear to a casual dinner?\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/message",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "chat", "message"]
+            }
+          }
+        },
+        {
+          "name": "Get Chat History",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/chat/history/{{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "chat", "history", "{{session_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Try-On",
+      "item": [
+        {
+          "name": "Virtual Try-On",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"outfit_id\": \"outfit_1\",\n  \"user_photo_url\": \"https://example.com/photo.jpg\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/tryon/virtual",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "tryon", "virtual"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Outfits",
+      "item": [
+        {
+          "name": "Create Custom Outfit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Summer Date Night\",\n  \"description\": \"Casual but put-together look\",\n  \"garment_ids\": [\"garment_1\", \"garment_2\", \"garment_3\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/outfits/create?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "outfits", "create"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Custom Outfits",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/outfits/list?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "outfits", "list"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Custom Outfit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/outfits/{{outfit_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "outfits", "{{outfit_id}}"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Custom Outfit",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/outfits/{{outfit_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "outfits", "{{outfit_id}}"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Share Custom Outfit",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/outfits/{{outfit_id}}/share?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "outfits", "{{outfit_id}}", "share"],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{user_id}}"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Image Consulting",
+      "item": [
+        {
+          "name": "Analyze Image",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": ""
+                },
+                {
+                  "key": "height_cm",
+                  "type": "text",
+                  "value": "170"
+                },
+                {
+                  "key": "weight_kg",
+                  "type": "text",
+                  "value": "65"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/image-consulting/analyze/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "image-consulting", "analyze", "{{user_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Get Image Consulting Result",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/image-consulting/result/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "image-consulting", "result", "{{user_id}}"]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "auth_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "user_id",
+      "value": "user_123",
+      "type": "string"
+    },
+    {
+      "key": "garment_id",
+      "value": "garment_1",
+      "type": "string"
+    },
+    {
+      "key": "outfit_id",
+      "value": "outfit_1",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string"
+    }
+  ]
+}
