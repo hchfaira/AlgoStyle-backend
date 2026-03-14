@@ -9,21 +9,8 @@ on:
 jobs:
   test:
     runs-on: [self-hosted, linux]
-    
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: algostyle
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: algostyle_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+    container:
+      image: python:3.11
 
     steps:
       - uses: actions/checkout@v4
@@ -54,9 +41,6 @@ jobs:
         run: isort --check-only .
 
       - name: Run tests with coverage
-        env:
-          DATABASE_URL: postgresql://algostyle:testpass@localhost:5432/algostyle_test
-          TESTING: "true"
         run: |
           pytest tests/ -v --cov=. --cov-report=xml --cov-report=term-missing
 
