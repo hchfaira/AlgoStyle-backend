@@ -1,5 +1,6 @@
 """
 Image consulting service — body/color/style analysis pipeline.
+Uses PostgreSQL database for persistence.
 """
 from __future__ import annotations
 
@@ -16,7 +17,8 @@ from models.schemas import (
     UserProfile,
     BodyAnalysis,
 )
-from services.store import consulting_cache, profiles
+from models.database import ImageConsultingResult as ImageConsultingResultDB, User, UserProfile as UserProfileDB
+from db import get_db_context
 
 
 # ──────────────────────────────────────────────────────────────
@@ -347,62 +349,90 @@ async def analyze_image(
     weight_kg: Optional[float] = None,
 ) -> ImageConsultingResult:
     """Run the full image consulting pipeline on a user photo."""
-    stored_profile = profiles.get(user_id)
-    if stored_profile:
-        height_cm = height_cm or stored_profile.height_cm
-        weight_kg = weight_kg or stored_profile.weight_kg
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        
+        profile = db.query(UserProfileDB).filter(UserProfileDB.user_id == user_id).first()
+        if profile:
+            height_cm = height_cm or profile.height_cm
+            weight_kg = weight_kg or profile.weight_kg
 
-    result = _mock_result(user_id, height_cm, weight_kg)
+        result = _mock_result(user_id, height_cm, weight_kg)
+        result.analyzed_at = datetime.utcnow()
 
-    result.analyzed_at = datetime.utcnow()
-    consulting_cache[user_id] = result
-
-    # Persist back to profile store
-    if stored_profile:
-        stored_profile.body_analysis = BodyAnalysis(
-            body_shape=result.body_shape,
-            skin_tone=result.skin_tone,
-            undertone=result.undertone,
-            hair_color=result.hair_color,
-            contrast_level=result.contrast_level,
-            estimated_top_size=result.estimated_top_size,
-            estimated_bottom_size=result.estimated_bottom_size,
-        )
-        if height_cm:
-            stored_profile.height_cm = height_cm
-        if weight_kg:
-            stored_profile.weight_kg = weight_kg
-        profiles[user_id] = stored_profile
-
-    return result
+        # Create or update database record
+        db_result = db.query(ImageConsultingResultDB).filter(
+            ImageConsultingResultDB.user_id == user_id
+        ).first()
+        
+        if not db_result:
+            db_result = ImageConsultingResultDB(user_id=user_id)
+        
+        db_result.body_shape = result.body_shape
+        db_result.face_shape = result.face_shape
+        db_result.skin_tone = result.skin_tone
+        db_result.undertone = result.undertone
+        db_result.hair_color = result.hair_color
+        db_result.contrast_level = result.contrast_level
+        db_result.visual_weight = result.visual_weight
+        db_result.color_season = result.color_season
+        db_result.estimated_top_size = result.estimated_top_size
+        db_result.estimated_bottom_size = result.estimated_bottom_size
+        db_result.color_palette = result.color_palette.model_dump() if result.color_palette else None
+        db_result.body_shape_guidance = result.body_shape_guidance.model_dump() if result.body_shape_guidance else None
+        db_result.face_shape_guidance = result.face_shape_guidance.model_dump() if result.face_shape_guidance else None
+        db_result.summary = result.summary
+        db_result.overall_confidence = result.overall_confidence
+        db_result.analyzed_at = result.analyzed_at
+        
+        db.add(db_result)
+        
+        # Also update profile with body analysis if profile exists
+        if profile:
+            profile.body_shape = result.body_shape
+            profile.skin_tone = result.skin_tone
+            profile.undertone = result.undertone
+            profile.hair_color = result.hair_color
+            profile.contrast_level = result.contrast_level
+            profile.estimated_top_size = result.estimated_top_size
+            profile.estimated_bottom_size = result.estimated_bottom_size
+            if height_cm:
+                profile.height_cm = height_cm
+            if weight_kg:
+                profile.weight_kg = weight_kg
+        
+        db.commit()
+        return result
 
 
 def get_cached_result(user_id: str) -> ImageConsultingResult:
     """Return the most recent cached image consulting result."""
-    result = consulting_cache.get(user_id)
-    if result:
-        return result
-
-    stored_profile = profiles.get(user_id)
-    if stored_profile and stored_profile.body_analysis:
-        ba = stored_profile.body_analysis
-        result = ImageConsultingResult(
-            user_id=user_id,
-            body_shape=ba.body_shape,
-            skin_tone=ba.skin_tone,
-            undertone=ba.undertone,
-            hair_color=ba.hair_color,
-            contrast_level=ba.contrast_level,
-            estimated_top_size=ba.estimated_top_size,
-            estimated_bottom_size=ba.estimated_bottom_size,
-            color_palette=_build_color_palette(ba.undertone, ba.skin_tone, ba.contrast_level),
-            body_shape_guidance=_build_body_guidance(ba.body_shape),
-            face_shape_guidance=None,
-            color_season=_compute_season(ba.undertone, ba.contrast_level),
-            summary=_build_summary(ba.body_shape, ba.skin_tone, ba.undertone, ba.contrast_level),
-            overall_confidence=0.5,
-        )
-        consulting_cache[user_id] = result
-        return result
-
-    raise HTTPException(404, "No image consulting result found. Please run the analysis first.")
+    with get_db_context() as db:
+        db_result = db.query(ImageConsultingResultDB).filter(
+            ImageConsultingResultDB.user_id == user_id
+        ).first()
+        
+        if db_result:
+            return ImageConsultingResult(
+                user_id=db_result.user_id,
+                body_shape=db_result.body_shape,
+                face_shape=db_result.face_shape,
+                skin_tone=db_result.skin_tone,
+                undertone=db_result.undertone,
+                hair_color=db_result.hair_color,
+                contrast_level=db_result.contrast_level,
+                visual_weight=db_result.visual_weight,
+                color_season=db_result.color_season,
+                estimated_top_size=db_result.estimated_top_size,
+                estimated_bottom_size=db_result.estimated_bottom_size,
+                color_palette=ColorPaletteRecommendation(**db_result.color_palette) if db_result.color_palette else None,
+                body_shape_guidance=BodyShapeGuidance(**db_result.body_shape_guidance) if db_result.body_shape_guidance else None,
+                face_shape_guidance=FaceShapeGuidance(**db_result.face_shape_guidance) if db_result.face_shape_guidance else None,
+                summary=db_result.summary,
+                overall_confidence=db_result.overall_confidence,
+                analyzed_at=db_result.analyzed_at,
+            )
+        
+        raise HTTPException(404, "No image consulting result found. Please run the analysis first.")

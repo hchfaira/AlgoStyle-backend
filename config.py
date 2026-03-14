@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # Environment
     environment: str = "development"  # development, staging, production
     
+    # Database
+    database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/algostyle"
+    
     # CORS Configuration
     cors_origins: str = "http://localhost:3000,http://localhost:8081,http://192.168.1.71:8000"
     cors_credentials: bool = True

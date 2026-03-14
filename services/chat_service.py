@@ -1,12 +1,13 @@
 """
 Chat service — conversational style assistant logic.
+Uses PostgreSQL database for persistence.
 """
-import uuid
 import random
 from typing import List
 
 from models.schemas import ChatResponse
-from services.store import chat_sessions
+from models.database import ChatSession
+from db import get_db_context
 
 
 MOCK_RESPONSES = [
@@ -26,32 +27,48 @@ SUGGESTION_SETS: List[List[str]] = [
 
 def create_session(user_id: str = "") -> str:
     """Create a new chat session and return the session ID."""
-    sid = f"chat_{uuid.uuid4().hex[:10]}"
-    chat_sessions[sid] = []
-    return sid
+    with get_db_context() as db:
+        session = ChatSession(user_id=user_id if user_id else None, messages=[])
+        db.add(session)
+        db.commit()
+        return session.id
 
 
 def process_message(session_id: str, message: str) -> ChatResponse:
     """Process a user message and generate a response."""
-    history = chat_sessions.setdefault(session_id, [])
-    history.append({"role": "user", "content": message})
-
-    # V1: Mock response. Production: calls ConversationHandler / LLM
-    response_text = random.choice(MOCK_RESPONSES)
-    suggestions = random.choice(SUGGESTION_SETS)
-
-    history.append({"role": "assistant", "content": response_text})
-
-    return ChatResponse(
-        session_id=session_id,
-        response=response_text,
-        suggestions=suggestions,
-    )
+    with get_db_context() as db:
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise Exception("Session not found")
+        
+        messages = session.messages if session.messages else []
+        messages.append({"role": "user", "content": message})
+        
+        # V1: Mock response. Production: calls ConversationHandler / LLM
+        response_text = random.choice(MOCK_RESPONSES)
+        suggestions = random.choice(SUGGESTION_SETS)
+        
+        messages.append({"role": "assistant", "content": response_text})
+        session.messages = messages
+        
+        db.commit()
+        
+        return ChatResponse(
+            session_id=session_id,
+            response=response_text,
+            suggestions=suggestions,
+        )
 
 
 def get_history(session_id: str) -> dict:
     """Get chat history for a session."""
-    return {
-        "session_id": session_id,
-        "messages": chat_sessions.get(session_id, []),
-    }
+    with get_db_context() as db:
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise Exception("Session not found")
+        
+        return {
+            "session_id": session_id,
+            "messages": session.messages if session.messages else [],
+        }
+

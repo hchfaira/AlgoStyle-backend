@@ -11,12 +11,24 @@ import os
 
 from config import settings
 from routes import auth, onboarding, wardrobe, recommendation, chat, tryon, outfit, explain, image_consulting
+from db import init_db, test_connection
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle events."""
     print("🚀 AlgoStyle API starting...")
+    
+    # Initialize database on startup
+    try:
+        init_db()
+        if test_connection():
+            print("✅ Database ready for requests")
+        else:
+            print("⚠️  Database connection test failed - check configuration")
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+    
     yield
     print("👋 AlgoStyle API shutting down...")
 

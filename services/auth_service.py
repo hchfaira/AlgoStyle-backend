@@ -1,14 +1,16 @@
 """
 Auth service — handles user registration, login, and token management.
+Uses PostgreSQL database for persistence.
 """
 import hashlib
 import secrets
-import uuid
 from typing import Optional
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from models.schemas import AuthResponse, UserRole
-from services.store import users, tokens, email_index
+from models.database import User, UserToken
+from db import get_db_context
 
 
 def hash_password(pw: str) -> str:
@@ -21,89 +23,112 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def generate_user_id(prefix: str = "user") -> str:
-    """Generate a unique user ID."""
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
-
-
 def register_user(email: str, password: str, name: str, role: UserRole = UserRole.USER) -> AuthResponse:
     """Register a new user account."""
-    if email in email_index:
-        raise HTTPException(400, "Email already registered")
-
-    uid = generate_user_id()
-    token = generate_token()
-
-    users[uid] = {
-        "user_id": uid,
-        "email": email,
-        "name": name,
-        "password_hash": hash_password(password),
-        "role": role,
-        "is_onboarded": False,
-    }
-    email_index[email] = uid
-    tokens[token] = uid
-
-    return AuthResponse(
-        user_id=uid,
-        token=token,
-        name=name,
-        email=email,
-        role=role,
-        is_onboarded=False,
-    )
+    with get_db_context() as db:
+        # Check if email already exists
+        existing = db.query(User).filter(User.email == email).first()
+        if existing:
+            raise HTTPException(400, "Email already registered")
+        
+        # Create new user
+        user = User(
+            email=email,
+            password_hash=hash_password(password),
+            name=name,
+            role=role.value,
+            is_onboarded=False,
+        )
+        db.add(user)
+        db.flush()
+        
+        # Create token
+        token = generate_token()
+        user_token = UserToken(user_id=user.id, token=token)
+        db.add(user_token)
+        db.commit()
+        
+        return AuthResponse(
+            user_id=user.id,
+            token=token,
+            name=user.name,
+            email=user.email,
+            role=UserRole(user.role),
+            is_onboarded=user.is_onboarded,
+        )
 
 
 def login_user(email: str, password: str) -> AuthResponse:
     """Authenticate and log in a user."""
-    uid = email_index.get(email)
-    if not uid:
-        raise HTTPException(401, "Invalid credentials")
-
-    user = users[uid]
-    if user["password_hash"] != hash_password(password):
-        raise HTTPException(401, "Invalid credentials")
-
-    token = generate_token()
-    tokens[token] = uid
-
-    return AuthResponse(
-        user_id=uid,
-        token=token,
-        name=user["name"],
-        email=user["email"],
-        role=user["role"],
-        is_onboarded=user.get("is_onboarded", False),
-    )
+    with get_db_context() as db:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(401, "Invalid credentials")
+        
+        if user.password_hash != hash_password(password):
+            raise HTTPException(401, "Invalid credentials")
+        
+        # Create token
+        token = generate_token()
+        user_token = UserToken(user_id=user.id, token=token)
+        db.add(user_token)
+        db.commit()
+        
+        return AuthResponse(
+            user_id=user.id,
+            token=token,
+            name=user.name,
+            email=user.email,
+            role=UserRole(user.role),
+            is_onboarded=user.is_onboarded,
+        )
 
 
 def create_guest() -> AuthResponse:
     """Create a guest user session."""
-    uid = generate_user_id("guest")
-    token = generate_token()
-    users[uid] = {
-        "user_id": uid,
-        "email": "",
-        "name": "Guest",
-        "password_hash": "",
-        "role": UserRole.USER,
-        "is_onboarded": False,
-    }
-    tokens[token] = uid
-    return AuthResponse(
-        user_id=uid,
-        token=token,
-        name="Guest",
-        email="",
-        role=UserRole.USER,
-        is_onboarded=False,
-    )
+    with get_db_context() as db:
+        user = User(
+            email="",  # Guest has no email
+            password_hash="",
+            name="Guest",
+            role=UserRole.USER.value,
+            is_onboarded=False,
+        )
+        db.add(user)
+        db.flush()
+        
+        # Create token
+        token = generate_token()
+        user_token = UserToken(user_id=user.id, token=token)
+        db.add(user_token)
+        db.commit()
+        
+        return AuthResponse(
+            user_id=user.id,
+            token=token,
+            name=user.name,
+            email=user.email,
+            role=UserRole(user.role),
+            is_onboarded=user.is_onboarded,
+        )
 
 
 def get_user_by_token(token: str) -> Optional[dict]:
     """Look up user data from token."""
-    uid = tokens.get(token)
-    if not uid:
-        raise HTTPException(401, "Invalid token")
-    return users.get(uid)
+    with get_db_context() as db:
+        user_token = db.query(UserToken).filter(UserToken.token == token).first()
+        if not user_token:
+            raise HTTPException(401, "Invalid token")
+        
+        user = db.query(User).filter(User.id == user_token.user_id).first()
+        if not user:
+            raise HTTPException(401, "Invalid token")
+        
+        return {
+            "user_id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role,
+            "is_onboarded": user.is_onboarded,
+        }
+
