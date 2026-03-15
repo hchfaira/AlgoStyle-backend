@@ -80,3 +80,51 @@ async def smart_suggestions(user_id: str):
 async def closet_audit(user_id: str):
     """Detect underused, hard-to-combine or outdated items."""
     return wardrobe_service.closet_audit(user_id)
+
+
+# ── Capsule Intelligence endpoints ───────────────────────────
+
+@router.get("/capsule-score")
+async def capsule_score(user_id: str):
+    """Compute capsule cohesion score for the user's wardrobe."""
+    return wardrobe_service.get_capsule_score(user_id)
+
+
+@router.get("/items/{garment_id}/analysis")
+async def garment_analysis(user_id: str, garment_id: str):
+    """Per-garment analysis: versatility, compatibility, impact score."""
+    return wardrobe_service.get_garment_analysis(user_id, garment_id)
+
+
+@router.get("/missing-pieces")
+async def missing_pieces(user_id: str, limit: int = Query(5, ge=1, le=10)):
+    """Recommend missing capsule pieces ranked by ROI."""
+    return wardrobe_service.get_missing_pieces(user_id, limit)
+
+
+@router.get("/capsule-evolution")
+async def capsule_evolution(user_id: str, days: int = Query(90, ge=7, le=365)):
+    """Return capsule score evolution over time."""
+    return wardrobe_service.get_capsule_evolution(user_id, days)
+
+
+@router.get("/smart-removal")
+async def smart_removal(user_id: str, profile: str = Query("balanced")):
+    """Suggest garments to remove based on a declutter profile (minimalist/balanced/generous)."""
+    return wardrobe_service.get_smart_removal(user_id, profile)
+
+
+@router.get("/sort-scores")
+async def sort_scores(user_id: str):
+    """Return per-garment scores for Versatility / Redundancy / Seasonal / Impact sort modes."""
+    return wardrobe_service.get_sort_scores(user_id)
+
+
+@router.get("/capsule-generate")
+async def capsule_generate(
+    user_id: str,
+    occasion: Optional[str] = None,
+    season: Optional[str] = None,
+):
+    """Generate an optimised capsule for a given occasion and/or season."""
+    return wardrobe_service.generate_capsule(user_id, occasion, season)

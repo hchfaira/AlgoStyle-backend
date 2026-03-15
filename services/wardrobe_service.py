@@ -391,3 +391,608 @@ def closet_audit(user_id: str) -> dict:
         }
 
         return {"flagged_items": flagged, "summary": summary}
+
+
+# ── Capsule Score ─────────────────────────────────────────────
+
+CAPSULE_GRADE_LABELS = {
+    (90, 101): ("S", "Exceptional"),
+    (75, 90): ("A", "Excellent"),
+    (60, 75): ("B", "Good"),
+    (40, 60): ("C", "Fair"),
+    (0, 40): ("D", "Needs work"),
+}
+
+CAPSULE_TIPS = {
+    "D": "Start with 3 neutral basics — white top, dark bottom, versatile outerwear.",
+    "C": "Add one more neutral piece to significantly boost outfit count.",
+    "B": "Introduce one accent colour to elevate combination potential.",
+    "A": "Your capsule is strong — focus on quality over quantity.",
+    "S": "Perfect capsule. Consider seasonal capsule expansion.",
+}
+
+
+def _grade(score: float) -> tuple[str, str]:
+    for (lo, hi), (letter, label) in CAPSULE_GRADE_LABELS.items():
+        if lo <= score < hi:
+            return letter, label
+    return "D", "Needs work"
+
+
+def get_capsule_score(user_id: str) -> dict:
+    """Compute capsule cohesion score for a user's wardrobe."""
+    with get_db_context() as db:
+        items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+
+        if not items:
+            return {
+                "score": 0,
+                "grade": "D",
+                "grade_label": "Empty wardrobe",
+                "breakdown": {"versatility": 0, "colour_cohesion": 0, "occasion_coverage": 0, "season_balance": 0},
+                "total_items": 0,
+                "tip": "Add items to start building your capsule.",
+                "top_opportunities": [],
+            }
+
+        total = len(items)
+        categories = set(g.category for g in items)
+
+        # Versatility: how many categories covered (6 max) → 0–1
+        versatility = min(len(categories) / 6, 1.0)
+
+        # Colour cohesion: ratio of neutrals (white/black/grey/beige/navy/tan) to total
+        neutral_keywords = {"white", "black", "grey", "gray", "beige", "navy", "tan", "cream", "nude"}
+        neutral_count = sum(
+            1 for g in items
+            if any(n in g.color_primary.lower() for n in neutral_keywords)
+        )
+        colour_cohesion = min(neutral_count / max(total, 1) + 0.3, 1.0)  # +0.3 base for any wardrobe
+
+        # Occasion coverage: distinct formality values
+        formality_vals = set(g.formality for g in items)
+        occasion_coverage = min(len(formality_vals) / 4, 1.0)
+
+        # Season balance: distinct seasons covered
+        all_seasons: set = set()
+        for g in items:
+            all_seasons.update(g.seasons or [])
+        season_balance = min(len(all_seasons) / 4, 1.0)
+
+        raw = (versatility * 0.30 + colour_cohesion * 0.30 + occasion_coverage * 0.20 + season_balance * 0.20) * 100
+        score = round(min(raw, 100), 1)
+        grade, grade_label = _grade(score)
+
+        # Opportunities
+        opps = []
+        if versatility < 0.8:
+            missing = [c for c in ["top", "bottom", "outerwear", "shoes", "accessory", "dress"] if c not in categories]
+            if missing:
+                opps.append({"type": "category", "label": f"Add a {missing[0]}", "impact": "+5–10 pts"})
+        if colour_cohesion < 0.7:
+            opps.append({"type": "colour", "label": "Add a neutral piece", "impact": "+8 pts"})
+        if occasion_coverage < 0.75:
+            opps.append({"type": "occasion", "label": "Add a formal piece", "impact": "+6 pts"})
+
+        return {
+            "score": score,
+            "grade": grade,
+            "grade_label": grade_label,
+            "breakdown": {
+                "versatility": round(versatility * 100, 1),
+                "colour_cohesion": round(colour_cohesion * 100, 1),
+                "occasion_coverage": round(occasion_coverage * 100, 1),
+                "season_balance": round(season_balance * 100, 1),
+            },
+            "total_items": total,
+            "tip": CAPSULE_TIPS.get(grade, ""),
+            "top_opportunities": opps[:3],
+        }
+
+
+# ── Garment Analysis ──────────────────────────────────────────
+
+def get_garment_analysis(user_id: str, garment_id: str) -> dict:
+    """Per-garment analysis: versatility, compatibility, season readiness, impact score."""
+    with get_db_context() as db:
+        garment = db.query(GarmentItemDB).filter(
+            GarmentItemDB.id == garment_id,
+            GarmentItemDB.user_id == user_id
+        ).first()
+        if not garment:
+            raise HTTPException(404, "Garment not found")
+
+        wardrobe = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+        total = len(wardrobe)
+
+        # Versatility: seasons count + neutralness
+        seasons_count = len(garment.seasons or [])
+        neutral_keywords = {"white", "black", "grey", "gray", "beige", "navy", "tan"}
+        is_neutral = any(n in garment.color_primary.lower() for n in neutral_keywords)
+        versatility = min((seasons_count / 4 * 0.5 + (0.5 if is_neutral else 0.2)), 1.0)
+
+        # Compatibility: how many other categories can pair with this
+        cat_pairs = {
+            "top": ["bottom", "outerwear", "shoes", "accessory"],
+            "bottom": ["top", "shoes", "accessory", "outerwear"],
+            "dress": ["shoes", "accessory", "outerwear"],
+            "outerwear": ["top", "bottom", "dress", "shoes"],
+            "shoes": ["top", "bottom", "dress"],
+            "accessory": ["top", "bottom", "dress", "outerwear"],
+        }
+        compatible_cats = cat_pairs.get(garment.category, [])
+        wardrobe_cats = set(g.category for g in wardrobe if g.id != garment_id)
+        matched = sum(1 for c in compatible_cats if c in wardrobe_cats)
+        compatibility = matched / max(len(compatible_cats), 1)
+
+        # Estimated outfit count
+        outfit_count = max(1, int(compatibility * total * versatility * 0.6))
+
+        # Impact: removing this garment's loss
+        impact_score = round((versatility * 0.4 + compatibility * 0.6) * 100, 1)
+
+        seasons = garment.seasons or []
+        current_seasons_ready = len(seasons)
+
+        return {
+            "garment_id": garment_id,
+            "name": garment.subcategory or garment.category,
+            "versatility_score": round(versatility * 100, 1),
+            "compatibility_score": round(compatibility * 100, 1),
+            "outfit_count": outfit_count,
+            "impact_score": impact_score,
+            "seasons": seasons,
+            "season_count": current_seasons_ready,
+            "is_neutral": is_neutral,
+            "formality": garment.formality,
+            "times_worn": garment.times_worn,
+            "tags": garment.tags or [],
+            "verdict": (
+                "Core piece" if impact_score > 70
+                else "Useful" if impact_score > 45
+                else "Limited use"
+            ),
+            "verdict_color": (
+                "#018849" if impact_score > 70
+                else "#FF8800" if impact_score > 45
+                else "#D01345"
+            ),
+        }
+
+
+# ── Missing Pieces ────────────────────────────────────────────
+
+MISSING_PIECES_CATALOGUE = [
+    {"category": "top", "subcategory": "White Oxford Shirt", "reason": "Works with every bottom you own", "roi": 9.5, "price_estimate": "€45–90", "color_hex": "#F8F6F0", "outfits_unlocked": 12},
+    {"category": "bottom", "subcategory": "Dark Slim Jeans", "reason": "Pairs with casual and smart tops", "roi": 9.2, "price_estimate": "€60–120", "color_hex": "#1B2A4A", "outfits_unlocked": 10},
+    {"category": "shoes", "subcategory": "White Leather Sneakers", "reason": "Completes casual & smart-casual looks", "roi": 8.8, "price_estimate": "€80–150", "color_hex": "#F5F5F5", "outfits_unlocked": 14},
+    {"category": "outerwear", "subcategory": "Classic Trench Coat", "reason": "Elevates every outfit across seasons", "roi": 8.5, "price_estimate": "€120–250", "color_hex": "#C19A6B", "outfits_unlocked": 11},
+    {"category": "accessory", "subcategory": "Minimalist Watch", "reason": "Adds polish to casual and business looks", "roi": 7.9, "price_estimate": "€80–200", "color_hex": "#2D2D2D", "outfits_unlocked": 8},
+    {"category": "bottom", "subcategory": "Beige Chinos", "reason": "A neutral that bridges casual and smart", "roi": 7.8, "price_estimate": "€50–100", "color_hex": "#D4C5A9", "outfits_unlocked": 9},
+    {"category": "top", "subcategory": "Striped Breton Top", "reason": "Effortless French chic versatility", "roi": 7.2, "price_estimate": "€35–70", "color_hex": "#FFFFFF", "outfits_unlocked": 7},
+]
+
+
+def get_missing_pieces(user_id: str, limit: int = 5) -> dict:
+    """Recommend missing capsule pieces with ROI-sorted priority."""
+    with get_db_context() as db:
+        items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+        existing_cats = set(g.category for g in items)
+
+        # Prioritise categories not well represented
+        cat_counts: dict[str, int] = {}
+        for g in items:
+            cat_counts[g.category] = cat_counts.get(g.category, 0) + 1
+
+        def priority(piece: dict) -> float:
+            count = cat_counts.get(piece["category"], 0)
+            return piece["roi"] * (1.5 if count == 0 else 1.0 if count < 2 else 0.6)
+
+        sorted_pieces = sorted(MISSING_PIECES_CATALOGUE, key=priority, reverse=True)
+        result = sorted_pieces[:limit]
+
+        return {
+            "missing_pieces": result,
+            "total_recommendations": len(result),
+            "insight": (
+                f"Adding these {len(result)} pieces could unlock up to "
+                f"{sum(p['outfits_unlocked'] for p in result)} new outfit combinations."
+            ),
+        }
+
+
+# ── Capsule Evolution ─────────────────────────────────────────
+
+def get_capsule_evolution(user_id: str, days: int = 90) -> dict:
+    """Return capsule score snapshots over time (mock timeline)."""
+    with get_db_context() as db:
+        items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+
+        if not items:
+            return {"snapshots": [], "trend": "flat", "improvement": 0}
+
+        # Get current score
+        current_data = get_capsule_score(user_id)
+        current_score = current_data["score"]
+
+        # Generate mock history (simulates gradual improvement)
+        import math
+        snapshots = []
+        num_points = min(days // 10, 9) + 1
+        for i in range(num_points):
+            day_offset = days - (i * (days // num_points))
+            historical_score = max(10, current_score - (num_points - i - 1) * 3.5)
+            snapshots.append({
+                "days_ago": day_offset,
+                "score": round(historical_score, 1),
+                "items_count": max(1, len(items) - (num_points - i - 1) * 2),
+            })
+
+        # Add current
+        snapshots.append({"days_ago": 0, "score": current_score, "items_count": len(items)})
+
+        first_score = snapshots[0]["score"]
+        improvement = round(current_score - first_score, 1)
+        trend = "improving" if improvement > 2 else "declining" if improvement < -2 else "stable"
+
+        return {
+            "snapshots": snapshots,
+            "trend": trend,
+            "improvement": improvement,
+            "current_score": current_score,
+            "period_days": days,
+        }
+
+
+# ── Smart Removal ─────────────────────────────────────────────
+
+REMOVAL_PROFILES = {
+    "minimalist": {"max_items": 20, "never_worn_threshold": 0, "low_use_threshold": 2},
+    "balanced": {"max_items": 35, "never_worn_threshold": 1, "low_use_threshold": 3},
+    "generous": {"max_items": 50, "never_worn_threshold": 2, "low_use_threshold": 5},
+}
+
+
+def get_smart_removal(user_id: str, profile: str = "balanced") -> dict:
+    """Suggest garments to remove based on a declutter profile."""
+    with get_db_context() as db:
+        items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+
+        p = REMOVAL_PROFILES.get(profile, REMOVAL_PROFILES["balanced"])
+        candidates = []
+
+        for g in items:
+            risk_score = 0
+            reasons = []
+
+            if g.times_worn == 0:
+                risk_score += 40
+                reasons.append("Never worn")
+            elif g.times_worn <= p["low_use_threshold"]:
+                risk_score += 20
+                reasons.append(f"Worn only {g.times_worn} time(s)")
+
+            seasons = g.seasons or []
+            if len(seasons) <= 1:
+                risk_score += 15
+                reasons.append("Single season only")
+
+            # Low confidence
+            if g.confidence < 0.6:
+                risk_score += 10
+                reasons.append("Low style match")
+
+            if risk_score >= 20:
+                cat = g.category
+                outfit_count = random.randint(0, 6)
+                removal_impact = "safe" if outfit_count == 0 else "low" if outfit_count <= 2 else "medium"
+                candidates.append({
+                    "garment": garment_db_to_schema(g).model_dump(),
+                    "risk_score": min(risk_score, 100),
+                    "reasons": reasons,
+                    "outfit_count": outfit_count,
+                    "removal_impact": removal_impact,
+                    "restyle_ideas": RESTYLE_IDEAS.get(cat, []),
+                })
+
+        candidates.sort(key=lambda x: x["risk_score"], reverse=True)
+
+        return {
+            "candidates": candidates[:10],
+            "total_candidates": len(candidates),
+            "profile": profile,
+            "current_count": len(items),
+            "target_count": p["max_items"],
+            "summary": (
+                f"{len(candidates)} item(s) identified as low-impact — "
+                f"removing them would bring your wardrobe to {max(len(items) - len(candidates), 0)} core pieces."
+            ),
+        }
+
+
+# ── Sort Scores ────────────────────────────────────────────────
+
+# Current season detection (northern hemisphere)
+def _current_season() -> str:
+    import datetime
+    month = datetime.date.today().month
+    if month in (12, 1, 2):   return "winter"
+    if month in (3, 4, 5):    return "spring"
+    if month in (6, 7, 8):    return "summer"
+    return "autumn"
+
+_SEASON_LABEL_MAP = {
+    "winter": {"winter": "Season-ready 🎿", "all": "Adaptable ✓", "summer": "Store away 📦", "spring": "Not ideal", "autumn": "Passable"},
+    "spring": {"spring": "Season-ready 🌸", "all": "Adaptable ✓", "winter": "Store away 📦", "summer": "Not ideal", "autumn": "Passable"},
+    "summer": {"summer": "Season-ready ☀️", "all": "Adaptable ✓", "winter": "Store away 📦", "spring": "Passable", "autumn": "Not ideal"},
+    "autumn": {"autumn": "Season-ready 🍂", "all": "Adaptable ✓", "summer": "Store away 📦", "winter": "Not ideal", "spring": "Passable"},
+}
+
+_SEASON_SCORE_MAP = {
+    "winter":  {"winter": 100, "all": 80, "autumn": 55, "spring": 40, "summer": 10},
+    "spring":  {"spring": 100, "all": 80, "summer": 60, "autumn": 40, "winter": 10},
+    "summer":  {"summer": 100, "all": 80, "spring": 60, "autumn": 40, "winter": 10},
+    "autumn":  {"autumn": 100, "all": 80, "winter": 70, "spring": 45, "summer": 10},
+}
+
+
+def get_sort_scores(user_id: str) -> dict:
+    """
+    Return per-garment scores for Versatility / Redundancy / Seasonal / Impact.
+    All scores are 0–100 (higher = more of that property).
+    """
+    with get_db_context() as db:
+        items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+
+    if not items:
+        return {"scores": [], "current_season": _current_season()}
+
+    season = _current_season()
+    season_labels  = _SEASON_LABEL_MAP[season]
+    season_scores  = _SEASON_SCORE_MAP[season]
+
+    # ── Build a simple colour / category lookup for redundancy ──
+    from collections import Counter
+    cat_color_pairs = Counter()
+    for g in items:
+        key = f"{g.category}:{(g.color_primary or '').lower()}"
+        cat_color_pairs[key] += 1
+
+    scores = []
+    for g in items:
+        # ── Versatility ──────────────────────────────────────────
+        # Approximated from: neutral colour +20, multi-season +20,
+        # casual/smart-casual +15, times_worn contribution
+        v = 40
+        neutral_colors = {"black", "white", "grey", "gray", "navy", "beige", "cream", "tan"}
+        if (g.color_primary or "").lower() in neutral_colors:
+            v += 20
+        seasons_list = g.seasons if isinstance(g.seasons, list) else []
+        if "all" in seasons_list or len(seasons_list) >= 3:
+            v += 20
+        elif len(seasons_list) >= 2:
+            v += 10
+        if (g.formality or "").lower() in ("casual", "smart_casual"):
+            v += 10
+        if g.times_worn and g.times_worn >= 10:
+            v += 10
+        versatility_score = min(v, 100)
+
+        # ── Redundancy ───────────────────────────────────────────
+        # How many near-duplicates exist (same category + same primary colour)
+        key = f"{g.category}:{(g.color_primary or '').lower()}"
+        dup_count = cat_color_pairs[key] - 1  # exclude itself
+        redundancy_score = min(dup_count * 35, 100)
+        redundancy_label = (
+            f"Similar to {dup_count} other {g.category}(s)" if dup_count > 0
+            else "Unique in your wardrobe"
+        )
+
+        # ── Seasonal ─────────────────────────────────────────────
+        best_season_score = 0
+        best_season_label = "Unknown"
+        for s in (seasons_list if seasons_list else ["all"]):
+            sc = season_scores.get(s, 30)
+            if sc > best_season_score:
+                best_season_score = sc
+                best_season_label = season_labels.get(s, "Passable")
+        seasonal_score = best_season_score
+
+        # ── Impact ───────────────────────────────────────────────
+        # How many outfits would be lost if this item is removed.
+        # Approximated: versatility × formality weight × worn frequency
+        base_impact = versatility_score
+        if g.times_worn and g.times_worn >= 5:
+            base_impact = min(base_impact + 15, 100)
+        if g.times_worn and g.times_worn == 0:
+            base_impact = max(base_impact - 30, 0)
+        impact_score = base_impact
+
+        scores.append({
+            "garment_id": g.id,
+            "versatility_score": versatility_score,
+            "redundancy_score": redundancy_score,
+            "seasonal_score": seasonal_score,
+            "impact_score": impact_score,
+            "redundancy_label": redundancy_label,
+            "seasonal_label": best_season_label,
+        })
+
+    return {"scores": scores, "current_season": season}
+
+
+# ── Capsule Generate ────────────────────────────────────────────────────────
+
+OCCASION_FILTERS = {
+    "work":    {"formality": ["formal", "business", "smart-casual"]},
+    "weekend": {"formality": ["casual", "smart-casual"]},
+    "evening": {"formality": ["formal", "semi-formal"]},
+    "travel":  {"formality": ["casual", "smart-casual"], "seasons": ["all"]},
+}
+
+SEASON_NAMES = {
+    "spring": "Spring", "summer": "Summer",
+    "autumn": "Autumn", "winter": "Winter",
+}
+
+OCCASION_NAMES = {
+    "work": "Work", "weekend": "Weekend",
+    "evening": "Evening", "travel": "Travel",
+}
+
+def generate_capsule(user_id: str, occasion: Optional[str], season: Optional[str]):
+    """
+    Select a focused capsule (10-15 items) from the user's wardrobe
+    optimised for the given occasion and/or season.
+    Returns a score, the selected items, top 3 missing pieces and a combination count.
+    """
+    with get_db_context() as db:
+        all_garments = db.query(GarmentItemDB).filter(
+            GarmentItemDB.user_id == user_id
+        ).all()
+
+    if not all_garments:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No garments found for this user.")
+
+    # Convert DB objects → domain objects
+    items = [_db_to_domain(g) for g in all_garments]
+
+    # ── Filter by season ────────────────────────────────────
+    if season:
+        season_filtered = [
+            g for g in items
+            if season in (g.attributes.seasons or [])
+            or "all" in (g.attributes.seasons or [])
+        ]
+        # Fall back to full wardrobe if filter leaves < 5 items
+        items = season_filtered if len(season_filtered) >= 5 else items
+
+    # ── Filter by occasion / formality ──────────────────────
+    if occasion and occasion in OCCASION_FILTERS:
+        allowed_formalities = OCCASION_FILTERS[occasion]["formality"]
+        occ_filtered = [
+            g for g in items
+            if g.attributes.formality in allowed_formalities
+        ]
+        items = occ_filtered if len(occ_filtered) >= 5 else items
+
+    # ── Score & rank items by versatility ───────────────────
+    # Proxy: items worn more + more seasons covered = higher priority
+    def item_score(g: GarmentItem) -> float:
+        s = len(g.attributes.seasons or []) * 15
+        s += min((g.times_worn or 0) * 3, 30)
+        if g.is_favorite:
+            s += 10
+        return s
+
+    items_sorted = sorted(items, key=item_score, reverse=True)
+
+    # ── Pick a balanced capsule (cap at 15) ─────────────────
+    CATEGORY_CAPS = {
+        "top": 4, "bottom": 3, "dress": 2,
+        "outerwear": 2, "shoes": 2, "accessory": 2,
+    }
+    capsule: List[GarmentItem] = []
+    cat_counts: Dict[str, int] = {c: 0 for c in CATEGORY_CAPS}
+
+    for g in items_sorted:
+        cat = g.attributes.category
+        if cat in cat_counts and cat_counts[cat] < CATEGORY_CAPS.get(cat, 2):
+            capsule.append(g)
+            cat_counts[cat] += 1
+        if len(capsule) >= 15:
+            break
+
+    # ── Compute combination count ────────────────────────────
+    def count_combos(cc: Dict[str, int]) -> int:
+        tops, bottoms, dresses = cc["top"], cc["bottom"], cc["dress"]
+        outerwear, shoes, accessories = cc["outerwear"], cc["shoes"], cc["accessory"]
+        if shoes == 0:
+            return 0
+        with_top = tops * max(bottoms, 1) * (outerwear + 1) * shoes * (accessories + 1) if tops else 0
+        with_dress = dresses * (outerwear + 1) * shoes * (accessories + 1) if dresses else 0
+        return with_top + with_dress
+
+    combo_count = count_combos(cat_counts)
+
+    # ── Build score (reuse existing logic) ──────────────────
+    score_data = get_capsule_score(user_id)
+
+    # ── Missing pieces (top 3) ───────────────────────────────
+    missing_data = get_missing_pieces(user_id, limit=3)
+
+    # ── Context label ────────────────────────────────────────
+    parts = []
+    if season:
+        parts.append(SEASON_NAMES.get(season, season.capitalize()))
+    if occasion:
+        parts.append(OCCASION_NAMES.get(occasion, occasion.capitalize()))
+    context_label = " ".join(parts) if parts else "Your Capsule"
+
+    # ── Insight ──────────────────────────────────────────────
+    insight = (
+        f"{len(capsule)} pieces selected for your {context_label.lower()} capsule, "
+        f"generating {combo_count} outfit combinations."
+    )
+
+    return {
+        "context_label": context_label,
+        "items": [_domain_to_dict(g) for g in capsule],
+        "score": score_data,
+        "missing": missing_data.get("missing_pieces", []),
+        "combination_count": combo_count,
+        "insight": insight,
+    }
+
+
+def _db_to_domain(g: GarmentItemDB) -> GarmentItem:
+    """Convert a DB row to the GarmentItem domain model."""
+    from models.schemas import GarmentAttributes as GA
+    attrs = GA(
+        category=g.category,
+        subcategory=getattr(g, "subcategory", None),
+        color_primary=g.color_primary or "unknown",
+        color_hex=getattr(g, "color_hex", None),
+        pattern=g.pattern or "solid",
+        formality=g.formality or "casual",
+        seasons=list(g.seasons) if g.seasons else [],
+        confidence=getattr(g, "confidence", 0.9),
+    )
+    return GarmentItem(
+        id=str(g.id),
+        user_id=str(g.user_id),
+        image_url=getattr(g, "image_url", None),
+        attributes=attrs,
+        is_favorite=g.is_favorite or False,
+        for_sale=g.for_sale or False,
+        tags=list(g.tags) if g.tags else [],
+        times_worn=g.times_worn or 0,
+        last_worn=str(g.last_worn) if g.last_worn else None,
+        created_at=str(g.created_at),
+    )
+
+
+def _domain_to_dict(g: GarmentItem) -> dict:
+    """Serialise a GarmentItem to a plain dict for JSON response."""
+    return {
+        "id": g.id,
+        "user_id": g.user_id,
+        "image_url": g.image_url,
+        "attributes": {
+            "category": g.attributes.category,
+            "subcategory": g.attributes.subcategory,
+            "color_primary": g.attributes.color_primary,
+            "color_hex": g.attributes.color_hex,
+            "pattern": g.attributes.pattern,
+            "formality": g.attributes.formality,
+            "seasons": g.attributes.seasons,
+            "confidence": g.attributes.confidence,
+        },
+        "is_favorite": g.is_favorite,
+        "for_sale": g.for_sale,
+        "tags": g.tags,
+        "times_worn": g.times_worn,
+        "last_worn": g.last_worn,
+        "created_at": g.created_at,
+    }
