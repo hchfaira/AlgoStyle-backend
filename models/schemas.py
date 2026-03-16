@@ -169,6 +169,31 @@ class WardrobeFilters(BaseModel):
     search: Optional[str] = None
 
 
+# ─── Garment Image Extraction ────────────────────────────────
+
+class ExtractionWarning(BaseModel):
+    """A quality or confidence warning raised during garment extraction."""
+    code: str           # e.g. "low_confidence", "multiple_garments", "poor_lighting"
+    severity: str       # "info" | "warning" | "error"
+    message: str        # Human-readable message shown to the user
+
+
+class GarmentExtractionResult(BaseModel):
+    """Result of analyzing a photo to extract a garment."""
+    # Extracted attributes (best-guess)
+    attributes: GarmentAttributes
+    # Quality / validation warnings
+    warnings: List[ExtractionWarning] = Field(default_factory=list)
+    # Whether the pipeline is confident enough to auto-confirm
+    auto_confirm: bool = False
+    # Number of garments detected (>1 means outfit photo)
+    garments_detected: int = 1
+    # Overall extraction confidence 0-1
+    confidence: float = 0.0
+    # Base64-encoded cropped garment image (optional — for preview)
+    cropped_image_b64: Optional[str] = None
+
+
 # ─── Recommendation Models ───────────────────────────────────
 
 class RecommendationConfig(BaseModel):

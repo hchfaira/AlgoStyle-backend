@@ -3,13 +3,45 @@ Wardrobe service — business logic for garment management,
 smart suggestions and closet audit.
 Uses PostgreSQL database for persistence.
 """
+import os
+import re
+import json
 import random
+import base64
+import asyncio
+from io import BytesIO
 from typing import Optional, List, Dict
 
 from fastapi import HTTPException
-from models.schemas import GarmentItem, GarmentAttributes, GarmentCategory
+from models.schemas import (
+    GarmentItem, GarmentAttributes, GarmentCategory,
+    GarmentExtractionResult, ExtractionWarning,
+)
 from models.database import GarmentItem as GarmentItemDB
 from db import get_db_context
+from services import neo4j_service
+
+# ── Gemini Vision setup ───────────────────────────────────────
+try:
+    # Load .env explicitly so GOOGLE_API_KEY is available at module init time
+    # (pydantic-settings loads it later; os.getenv alone isn't enough here)
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+    from google import genai as _genai
+    from PIL import Image as _PILImage
+    _GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+    if _GOOGLE_API_KEY:
+        _GEMINI_CLIENT = _genai.Client(api_key=_GOOGLE_API_KEY)
+        _GEMINI_MODEL_NAME = "gemini-2.5-flash"
+        _VISION_AVAILABLE = True
+        print(f"✅ Gemini Vision ready (model: {_GEMINI_MODEL_NAME})")
+    else:
+        _VISION_AVAILABLE = False
+        print("⚠️  GOOGLE_API_KEY not set — falling back to mock extraction")
+except ImportError as _e:
+    _VISION_AVAILABLE = False
+    print(f"⚠️  Gemini Vision unavailable ({_e}) — using mock extraction")
 
 
 # ── Smart-add suggestion catalogue ────────────────────────────
@@ -131,6 +163,203 @@ def mock_analyze_garment(category: Optional[str] = None) -> dict:
     }
 
 
+# Category catalogue for smarter mock extraction
+_CATEGORY_VARIANTS: Dict[str, dict] = {
+    "top": {
+        "subcategory": "shirt", "color_primary": "white", "color_hex": "#F8F8F8",
+        "formality": "casual", "material": "cotton",
+    },
+    "bottom": {
+        "subcategory": "trousers", "color_primary": "black", "color_hex": "#1A1A1A",
+        "formality": "smart_casual", "material": "cotton",
+    },
+    "dress": {
+        "subcategory": "midi dress", "color_primary": "beige", "color_hex": "#D4C5A9",
+        "formality": "smart_casual", "material": "polyester",
+    },
+    "outerwear": {
+        "subcategory": "blazer", "color_primary": "navy", "color_hex": "#1B2A4A",
+        "formality": "business", "material": "wool",
+    },
+    "shoes": {
+        "subcategory": "sneakers", "color_primary": "white", "color_hex": "#F5F5F5",
+        "formality": "casual", "material": "leather",
+    },
+    "accessory": {
+        "subcategory": "bag", "color_primary": "tan", "color_hex": "#C19A6B",
+        "formality": "casual", "material": "leather",
+    },
+}
+
+
+# ─── Gemini Vision prompt ────────────────────────────────────
+
+_GARMENT_EXTRACTION_PROMPT = """You are a professional fashion analyst. Analyze this clothing image and extract garment attributes.
+
+Return ONLY a valid JSON object with EXACTLY this structure — no markdown, no extra text:
+
+{
+  "category": "<one of: top, bottom, dress, outerwear, shoes, accessory, swimwear, sportswear>",
+  "subcategory": "<specific item type, e.g. 'white t-shirt', 'slim jeans', 'midi dress', 'leather sneakers'>",
+  "color_primary": "<main color name in plain English, e.g. 'white', 'navy blue', 'olive green'>",
+  "color_hex": "<best matching hex code, e.g. '#FFFFFF'>",
+  "color_secondary": "<second color if present, else null>",
+  "pattern": "<one of: solid, striped, checked, floral, geometric, animal_print, abstract, graphic, plain>",
+  "material": "<fabric/material, e.g. 'cotton', 'denim', 'wool', 'leather', 'silk', 'linen', 'polyester'>",
+  "formality": "<one of: casual, smart_casual, business, formal, athletic, loungewear>",
+  "seasons": ["<list from: spring, summer, fall, winter — all that apply>"],
+  "confidence": <0.0 to 1.0 — your confidence in this extraction>,
+  "garments_detected": <integer — how many separate garments are visible in the image>
+}
+
+Be precise. If you cannot identify something with confidence, use your best guess and lower the confidence score."""
+
+
+def _call_gemini_vision(image_bytes: bytes) -> dict:
+    """Call Gemini Vision synchronously and return parsed JSON dict."""
+    img = _PILImage.open(BytesIO(image_bytes))
+    response = _GEMINI_CLIENT.models.generate_content(
+        model=_GEMINI_MODEL_NAME,
+        contents=[_GARMENT_EXTRACTION_PROMPT, img],
+    )
+    text = response.text.strip()
+    # Strip markdown code fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def analyze_garment_image(
+    image_bytes: bytes,
+    mode: str = "auto",
+    hint_category: Optional[str] = None,
+) -> GarmentExtractionResult:
+    """
+    Analyze an image and extract garment attributes using Gemini Vision.
+    Falls back to mock data if Gemini is unavailable.
+    mode='outfit' → full outfit, detect all garments
+    mode='auto'   → single most prominent garment
+    """
+    warnings: List[ExtractionWarning] = []
+
+    # Quality check — small file → likely low-res
+    if len(image_bytes) < 50_000:
+        warnings.append(ExtractionWarning(
+            code="poor_lighting",
+            severity="warning",
+            message=(
+                "⚠️ Low-quality image detected — the photo is small or low-resolution "
+                "(under 50 KB). Colour and fabric detection may be less precise. "
+                "For best results, use a well-lit photo taken from 50–100 cm away."
+            ),
+        ))
+
+    # ── Real Gemini extraction ──────────────────────────────
+    if _VISION_AVAILABLE:
+        try:
+            raw = _call_gemini_vision(image_bytes)
+
+            confidence = float(raw.get("confidence", 0.80))
+            garments_detected = int(raw.get("garments_detected", 1))
+
+            # Validate category
+            raw_cat = raw.get("category", hint_category or "top").lower().replace(" ", "_")
+            valid_cats = {c.value for c in GarmentCategory}
+            if raw_cat not in valid_cats:
+                raw_cat = hint_category or "top"
+
+            # Multiple garments info
+            if mode == "outfit" and garments_detected > 1:
+                warnings.append(ExtractionWarning(
+                    code="multiple_garments",
+                    severity="info",
+                    message=(
+                        f"ℹ️ {garments_detected} garments found in this outfit photo. "
+                        "Each piece will be extracted and added to your wardrobe as a separate item."
+                    ),
+                ))
+
+            if confidence < 0.65:
+                warnings.append(ExtractionWarning(
+                    code="low_confidence",
+                    severity="warning",
+                    message=(
+                        f"⚠️ Uncertain extraction ({int(confidence * 100)}% confidence). "
+                        "Please check the detected category and colour below before saving."
+                    ),
+                ))
+
+            seasons_raw = raw.get("seasons", ["spring", "summer", "fall", "winter"])
+            valid_seasons = {"spring", "summer", "fall", "winter"}
+            seasons = [s for s in seasons_raw if s in valid_seasons] or ["spring", "summer", "fall", "winter"]
+
+            attrs = GarmentAttributes(
+                category=GarmentCategory(raw_cat),
+                subcategory=raw.get("subcategory"),
+                color_primary=raw.get("color_primary"),
+                color_hex=raw.get("color_hex"),
+                color_secondary=raw.get("color_secondary"),
+                pattern=raw.get("pattern"),
+                material=raw.get("material"),
+                formality=raw.get("formality"),
+                seasons=seasons,
+                confidence=confidence,
+            )
+
+            has_error = any(w.severity == "error" for w in warnings)
+            return GarmentExtractionResult(
+                attributes=attrs,
+                warnings=warnings,
+                auto_confirm=confidence >= 0.80 and not has_error,
+                garments_detected=garments_detected,
+                confidence=confidence,
+            )
+
+        except Exception as e:
+            # Add warning and fall through to mock
+            warnings.append(ExtractionWarning(
+                code="extraction_failed",
+                severity="warning",
+                message=f"⚠️ AI extraction encountered an issue ({type(e).__name__}). "
+                        "Using estimated values — please review and correct before saving.",
+            ))
+
+    # ── Fallback mock ───────────────────────────────────────
+    confidence = round(random.uniform(0.60, 0.75), 2)
+    cat = hint_category or random.choice(list(_CATEGORY_VARIANTS.keys()))
+    variant = _CATEGORY_VARIANTS.get(cat, _CATEGORY_VARIANTS["top"])
+
+    if confidence < 0.75:
+        warnings.append(ExtractionWarning(
+            code="low_confidence",
+            severity="warning",
+            message=(
+                f"⚠️ Could not analyse image ({int(confidence * 100)}% confidence). "
+                "Please review the values below and correct them before saving."
+            ),
+        ))
+
+    attrs = GarmentAttributes(
+        category=GarmentCategory(cat),
+        subcategory=variant["subcategory"],
+        color_primary=variant["color_primary"],
+        color_hex=variant["color_hex"],
+        pattern="solid",
+        material=variant["material"],
+        formality=variant["formality"],
+        seasons=["spring", "summer", "fall", "winter"],
+        confidence=confidence,
+    )
+    has_error = any(w.severity == "error" for w in warnings)
+    return GarmentExtractionResult(
+        attributes=attrs,
+        warnings=warnings,
+        auto_confirm=False,
+        garments_detected=1,
+        confidence=confidence,
+    )
+
+
 def garment_db_to_schema(g: GarmentItemDB) -> GarmentItem:
     """Convert database model to Pydantic schema."""
     return GarmentItem(
@@ -158,24 +387,60 @@ def garment_db_to_schema(g: GarmentItemDB) -> GarmentItem:
     )
 
 
-def add_garment(user_id: str, category: Optional[str] = None, image_bytes: Optional[bytes] = None) -> GarmentItem:
-    """Add a garment to a user's wardrobe."""
+def add_garment(
+    user_id: str,
+    category: Optional[str] = None,
+    image_bytes: Optional[bytes] = None,
+    extra_attrs: Optional[Dict[str, Optional[str]]] = None,
+) -> GarmentItem:
+    """
+    Add a garment to a user's wardrobe.
+    If extra_attrs are provided (from a confirmed extraction), use them directly.
+    Otherwise fall back to mock_analyze_garment.
+    """
     with get_db_context() as db:
-        attrs = mock_analyze_garment(category)
+        # Use confirmed extraction attrs when available
+        if extra_attrs and extra_attrs.get("category"):
+            attrs = {
+                "category":      extra_attrs.get("category") or "top",
+                "subcategory":   extra_attrs.get("subcategory"),
+                "color_primary": extra_attrs.get("color_primary") or "unknown",
+                "color_hex":     extra_attrs.get("color_hex"),
+                "pattern":       extra_attrs.get("pattern") or "solid",
+                "material":      extra_attrs.get("material"),
+                "formality":     extra_attrs.get("formality") or "casual",
+                "seasons":       ["spring", "summer", "fall", "winter"],
+                "confidence":    0.9,
+            }
+        else:
+            attrs = mock_analyze_garment(category)
+
         garment = GarmentItemDB(
             user_id=user_id,
+            # Store image as a base64 data-URI so the mobile app can display it directly
+            image_url=(
+                f"data:image/jpeg;base64,{base64.b64encode(image_bytes).decode()}"
+                if image_bytes else None
+            ),
             category=attrs["category"],
-            subcategory=attrs["subcategory"],
-            color_primary=attrs["color_primary"],
-            color_hex=attrs["color_hex"],
-            pattern=attrs["pattern"],
-            material=attrs["material"],
-            formality=attrs["formality"],
-            seasons=attrs["seasons"],
-            confidence=attrs["confidence"],
+            subcategory=attrs.get("subcategory"),
+            color_primary=attrs.get("color_primary", "unknown"),
+            color_hex=attrs.get("color_hex"),
+            pattern=attrs.get("pattern", "solid"),
+            material=attrs.get("material"),
+            formality=attrs.get("formality", "casual"),
+            seasons=attrs.get("seasons", ["spring", "summer", "fall", "winter"]),
+            confidence=attrs.get("confidence", 0.85),
         )
         db.add(garment)
         db.commit()
+        db.refresh(garment)
+        # ── Sync to Neo4j (fire-and-forget) ──────────────
+        neo4j_service.upsert_garment(
+            garment_id=garment.id,
+            user_id=user_id,
+            attrs={**attrs, "image_url": garment.image_url or ""},
+        )
         return garment_db_to_schema(garment)
 
 
@@ -252,7 +517,7 @@ def update_garment(user_id: str, garment_id: str, updates: dict) -> GarmentItem:
 
 
 def delete_garment(user_id: str, garment_id: str) -> dict:
-    """Delete a garment from wardrobe."""
+    """Delete a garment from PostgreSQL and Neo4j."""
     with get_db_context() as db:
         garment = db.query(GarmentItemDB).filter(
             GarmentItemDB.id == garment_id,
@@ -260,10 +525,11 @@ def delete_garment(user_id: str, garment_id: str) -> dict:
         ).first()
         if not garment:
             raise HTTPException(404, "Garment not found")
-        
         db.delete(garment)
         db.commit()
-        return {"status": "deleted", "id": garment_id}
+    # ── Remove from Neo4j (fire-and-forget) ──────────────
+    neo4j_service.delete_garment(garment_id)
+    return {"status": "deleted", "id": garment_id}
 
 
 def toggle_favorite(user_id: str, garment_id: str) -> dict:

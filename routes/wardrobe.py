@@ -1,25 +1,65 @@
 """
 Wardrobe routes — thin handlers delegating to wardrobe_service.
 """
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
-from models.schemas import GarmentItem
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
+from models.schemas import GarmentItem, GarmentExtractionResult
 from typing import Optional, List
 from services import wardrobe_service
 
 router = APIRouter()
 
 
+@router.post("/analyze-image", response_model=GarmentExtractionResult)
+async def analyze_garment_image(
+    user_id: str,
+    mode: str = Form(default="auto"),
+    hint_category: Optional[str] = Form(default=None),
+    image: UploadFile = File(...),
+):
+    """
+    Analyze an uploaded garment image.
+    Returns extracted attributes + quality warnings.
+    Does NOT save the garment — call POST /items to persist after confirmation.
+    mode: 'outfit' | 'auto'
+    """
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image file")
+    return wardrobe_service.analyze_garment_image(image_bytes, mode, hint_category)
+
+
 @router.post("/items", response_model=GarmentItem)
 async def add_garment(
     user_id: str,
-    category: Optional[str] = None,
-    image: Optional[UploadFile] = File(None),
+    category: Optional[str] = Query(default=None),
+    subcategory: Optional[str] = Query(default=None),
+    color_primary: Optional[str] = Query(default=None),
+    color_hex: Optional[str] = Query(default=None),
+    pattern: Optional[str] = Query(default=None),
+    material: Optional[str] = Query(default=None),
+    formality: Optional[str] = Query(default=None),
+    image: Optional[UploadFile] = File(default=None),
 ):
-    """Add a garment — upload image and optionally specify category."""
+    """
+    Save a confirmed garment to the wardrobe.
+    All garment attributes come as query params.
+    Image is optional multipart — stored if provided.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
     image_bytes = None
     if image:
         image_bytes = await image.read()
-    return wardrobe_service.add_garment(user_id, category, image_bytes)
+    attrs = {
+        "category": category,
+        "subcategory": subcategory,
+        "color_primary": color_primary,
+        "color_hex": color_hex,
+        "pattern": pattern,
+        "material": material,
+        "formality": formality,
+    }
+    return wardrobe_service.add_garment(user_id, category, image_bytes, extra_attrs=attrs)
 
 
 @router.get("/items", response_model=List[GarmentItem])

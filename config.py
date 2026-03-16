@@ -15,11 +15,21 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/algostyle"
     
+    # Google Gemini API
+    google_api_key: str = ""
+
+    # Neo4j (shared with LLM_project — garment graph)
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "neo4j_password_123"
+    neo4j_database: str = "neo4j"
+
     # CORS Configuration
     cors_origins: str = "http://localhost:3000,http://localhost:8081,http://192.168.1.71:8000"
     cors_credentials: bool = True
     cors_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
     cors_headers: List[str] = ["*"]
+    cors_expose_headers: List[str] = ["*"]
     
     class Config:
         env_file = ".env"

@@ -42,12 +42,18 @@ app = FastAPI(
 
 # CORS middleware - environment-aware configuration
 cors_origins = settings.get_cors_origins()
+is_dev = settings.environment == "development"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=settings.cors_credentials,
-    allow_methods=settings.cors_methods,
-    allow_headers=settings.cors_headers,
+    # In dev: wildcard ("*") so any Expo/browser origin works without listing every IP.
+    # In prod: restrict to explicit domains only.
+    allow_origins=["*"] if is_dev else cors_origins,
+    allow_origin_regex=None if is_dev else r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=False if is_dev else settings.cors_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 print(f"🔒 CORS enabled for: {cors_origins} (Environment: {settings.environment})")
