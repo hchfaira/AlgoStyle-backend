@@ -64,3 +64,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def get_settings() -> Settings:
+    """Compatibility shim — returns the singleton Settings instance."""
+    return settings

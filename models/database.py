@@ -120,22 +120,40 @@ class GarmentItem(Base):
 
 
 class CustomOutfit(Base):
-    """Custom outfit created by user."""
+    """Custom outfit created by user — may have a planned_date, reminder and AI score."""
     __tablename__ = "custom_outfits"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
-    
+
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
-    
+
     # Garment IDs as array
     garment_ids = Column(ARRAY(String), default=[])
-    
+
+    # ── Planning fields ────────────────────────────────────────
+    # ISO-8601 datetime (with TZ) when the user plans to wear this outfit
+    planned_date = Column(DateTime(timezone=True), nullable=True, index=True)
+    # Reminder: JSON blob {"type": "push"|"email"|"none", "minutes_before": 60}
+    reminder_setting = Column(JSON, nullable=True)
+    # IANA timezone of the user at planning time, e.g. "Europe/Paris"
+    user_timezone = Column(String(64), nullable=True)
+
+    # ── Source ────────────────────────────────────────────────
+    # How the outfit was created: build | ai | score | prompt
+    source = Column(String(32), default="build")
+
+    # ── AI scoring fields ─────────────────────────────────────
+    ai_grade = Column(String(4), nullable=True)
+    ai_score = Column(Float, nullable=True)
+    explanation_brief = Column(Text, nullable=True)
+    explanation_detailed = Column(Text, nullable=True)
+
     is_public = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
+
     user = relationship("User", back_populates="custom_outfits")
 
 

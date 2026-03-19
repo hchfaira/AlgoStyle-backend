@@ -1,7 +1,7 @@
 """Pydantic models for AlgoStyle mobile API."""
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, date
 from enum import Enum
 import uuid
 
@@ -222,6 +222,7 @@ class OutfitResult(BaseModel):
     id: str = Field(default_factory=lambda: f"outfit_{uuid.uuid4().hex[:10]}")
     rank: int
     name: str
+    grade: Optional[str] = None
     garments: List[GarmentItem]
     score: OutfitScore
     explanation_brief: Optional[str] = None
@@ -263,6 +264,20 @@ class TryOnResponse(BaseModel):
     processing_time_ms: float = 0.0
 
 
+# ─── Reminder & Planning Models ─────────────────────────────
+
+class ReminderType(str, Enum):
+    NONE  = "none"
+    PUSH  = "push"
+    EMAIL = "email"
+
+
+class ReminderSetting(BaseModel):
+    """Per-outfit reminder configuration."""
+    type: ReminderType = ReminderType.NONE
+    minutes_before: int = Field(default=60, ge=0, le=10080)  # up to 1 week
+
+
 # ─── Custom Outfit Models ────────────────────────────────────
 
 class CreateCustomOutfitRequest(BaseModel):
@@ -270,6 +285,25 @@ class CreateCustomOutfitRequest(BaseModel):
     description: Optional[str] = None
     garment_ids: List[str]
     is_public: bool = False
+    # Planning fields (optional)
+    planned_date: Optional[datetime] = None       # ISO-8601 with TZ preferred
+    reminder: Optional[ReminderSetting] = None
+    user_timezone: Optional[str] = None           # IANA e.g. "Europe/Paris"
+    source: str = "build"                         # build | ai | score | prompt
+    # AI scoring (carried from HybridOutfitRecommender)
+    ai_grade: Optional[str] = None
+    ai_score: Optional[float] = None
+    explanation_brief: Optional[str] = None
+    explanation_detailed: Optional[str] = None
+
+
+class UpdateOutfitPlanRequest(BaseModel):
+    """Patch just the planning fields on an existing outfit."""
+    planned_date: Optional[datetime] = None
+    reminder: Optional[ReminderSetting] = None
+    user_timezone: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 class CustomOutfit(BaseModel):
@@ -277,9 +311,19 @@ class CustomOutfit(BaseModel):
     name: str
     description: Optional[str] = None
     garments: List[GarmentItem]
+    is_public: bool = False
+    # Planning
+    planned_date: Optional[datetime] = None
+    reminder: Optional[ReminderSetting] = None
+    user_timezone: Optional[str] = None
+    source: str = "build"
+    # AI scoring
+    ai_grade: Optional[str] = None
+    ai_score: Optional[float] = None
+    explanation_brief: Optional[str] = None
+    explanation_detailed: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
-    is_public: bool = False
 
 
 class CustomOutfitResponse(BaseModel):

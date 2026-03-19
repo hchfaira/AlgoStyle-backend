@@ -1,14 +1,19 @@
 """
 Image consulting service — body/color/style analysis pipeline.
 Uses PostgreSQL database for persistence.
+Real analysis powered by Google Gemini Vision + LLM.
 """
 from __future__ import annotations
 
+import base64
+import json
+import re
 import time
 from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
+from loguru import logger
 from models.schemas import (
     ImageConsultingResult,
     ColorPaletteRecommendation,
@@ -333,8 +338,170 @@ def _mock_result(
 
 
 # ──────────────────────────────────────────────────────────────
-#  LLM pipeline runner
+#  LLM pipeline runner — Gemini Vision + structured JSON output
 # ──────────────────────────────────────────────────────────────
+
+_VISION_PROMPT = """You are an expert image consultant and personal stylist.
+Analyse the person in this photo and return a JSON object with EXACTLY these fields.
+Do NOT add markdown fences — return raw JSON only.
+
+{
+  "body_shape": "<hourglass|pear|inverted_triangle|rectangle|apple|athletic>",
+  "face_shape": "<oval|round|square|heart|diamond|rectangle>",
+  "skin_tone": "<very_light|light|medium_light|medium|medium_dark|dark|deep>",
+  "undertone": "<warm|cool|neutral>",
+  "hair_color": "<black|dark_brown|medium_brown|light_brown|blonde|auburn|red|grey|white>",
+  "contrast_level": "<low|medium|high|very_high>",
+  "visual_weight": "<light|medium|heavy|balanced>",
+  "summary_notes": "<2-3 sentences describing the person's style profile, colour season, and top recommendation>"
+}
+
+Rules:
+- Only classify what is visible. If uncertain, choose the most likely option.
+- contrast_level = perceived contrast between hair, eyes, and skin.
+- visual_weight = overall perceived size/presence.
+- summary_notes must be warm, personal, and actionable (no bullet points).
+"""
+
+_SUMMARY_SYSTEM = """You are a professional image consultant writing a warm, personal style profile summary.
+Write exactly 2-3 sentences. Be specific, encouraging, and actionable.
+Do NOT use bullet points. Do NOT repeat phrases like "You are a [season]" more than once."""
+
+
+async def _run_gemini_vision(image_bytes: bytes) -> dict:
+    """Send image to Gemini Vision and parse the structured JSON response."""
+    try:
+        import google.genai as genai
+        from google.genai import types as genai_types
+        from config import settings
+        client = genai.Client(api_key=settings.google_api_key)
+
+        import PIL.Image
+        import io
+        pil_image = PIL.Image.open(io.BytesIO(image_bytes))
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=[_VISION_PROMPT, pil_image],
+        )
+        raw = response.text.strip()
+
+        # Strip markdown code fences if model adds them
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"Gemini returned non-JSON, falling back to mock: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Gemini Vision call failed: {e}")
+        return {}
+
+
+async def _generate_llm_summary(profile: dict, height_cm: Optional[float], weight_kg: Optional[float]) -> str:
+    """Generate a personalized summary paragraph via Gemini."""
+    try:
+        import google.genai as genai
+        from config import settings
+        client = genai.Client(api_key=settings.google_api_key)
+
+        season = _compute_season(profile.get("undertone"), profile.get("contrast_level"))
+        body = profile.get("body_shape", "")
+        skin = profile.get("skin_tone", "")
+        undertone = profile.get("undertone", "")
+        face = profile.get("face_shape", "")
+        extra = profile.get("summary_notes", "")
+
+        prompt = (
+            _SUMMARY_SYSTEM + "\n\n"
+            f"Write a 2-3 sentence personal style profile summary for a person with:\n"
+            f"- Body shape: {body}\n"
+            f"- Face shape: {face}\n"
+            f"- Skin tone: {skin} with {undertone} undertones\n"
+            f"- Colour season: {season or 'unknown'}\n"
+            f"- Contrast level: {profile.get('contrast_level', '')}\n"
+            f"- Vision model notes: {extra}\n"
+            + (f"- Height: {height_cm} cm\n" if height_cm else "")
+            + (f"- Weight: {weight_kg} kg\n" if weight_kg else "")
+            + "\nBe warm, personal, and actionable."
+        )
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.warning(f"LLM summary generation failed, using rule-based fallback: {e}")
+        return ""
+
+
+async def _analyze_with_llm(
+    user_id: str,
+    image_bytes: bytes,
+    height_cm: Optional[float],
+    weight_kg: Optional[float],
+) -> ImageConsultingResult:
+    """Full real pipeline: Gemini Vision → structured profile → LLM summary."""
+    vision_data = await _run_gemini_vision(image_bytes)
+
+    if not vision_data:
+        # Graceful fallback to rule-based mock if vision fails
+        logger.warning(f"Vision returned empty for {user_id}, using mock fallback")
+        return _mock_result(user_id, height_cm, weight_kg)
+
+    body_shape     = vision_data.get("body_shape")
+    face_shape     = vision_data.get("face_shape")
+    skin_tone      = vision_data.get("skin_tone")
+    undertone      = vision_data.get("undertone")
+    hair_color     = vision_data.get("hair_color")
+    contrast_level = vision_data.get("contrast_level")
+    visual_weight  = vision_data.get("visual_weight")
+
+    color_season = _compute_season(undertone, contrast_level)
+    color_palette = _build_color_palette(undertone, skin_tone, contrast_level)
+    body_guidance = _build_body_guidance(body_shape)
+    face_guidance = _build_face_guidance(face_shape)
+
+    # Estimated sizes from height
+    top_size = bottom_size = None
+    if height_cm:
+        if height_cm < 158:
+            top_size = bottom_size = "XS / 34"
+        elif height_cm < 163:
+            top_size = bottom_size = "S / 36"
+        elif height_cm < 168:
+            top_size = bottom_size = "M / 38"
+        elif height_cm < 175:
+            top_size = bottom_size = "L / 40"
+        else:
+            top_size = bottom_size = "XL / 42"
+
+    # Generate personalized LLM summary
+    summary = await _generate_llm_summary(vision_data, height_cm, weight_kg)
+    if not summary:
+        summary = _build_summary(body_shape, skin_tone, undertone, contrast_level)
+
+    return ImageConsultingResult(
+        user_id=user_id,
+        body_shape=body_shape,
+        face_shape=face_shape,
+        skin_tone=skin_tone,
+        undertone=undertone,
+        hair_color=hair_color,
+        contrast_level=contrast_level,
+        visual_weight=visual_weight,
+        color_season=color_season,
+        estimated_top_size=top_size,
+        estimated_bottom_size=bottom_size,
+        color_palette=color_palette,
+        body_shape_guidance=body_guidance,
+        face_shape_guidance=face_guidance,
+        summary=summary,
+        overall_confidence=0.88,
+    )
+
+
 
 
 # ──────────────────────────────────────────────────────────────
@@ -353,23 +520,25 @@ async def analyze_image(
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(404, "User not found")
-        
+
         profile = db.query(UserProfileDB).filter(UserProfileDB.user_id == user_id).first()
         if profile:
             height_cm = height_cm or profile.height_cm
             weight_kg = weight_kg or profile.weight_kg
 
-        result = _mock_result(user_id, height_cm, weight_kg)
-        result.analyzed_at = datetime.utcnow()
+    # Run real Gemini Vision + LLM pipeline (outside DB context to avoid long lock)
+    result = await _analyze_with_llm(user_id, image_bytes, height_cm, weight_kg)
+    result.analyzed_at = datetime.utcnow()
 
-        # Create or update database record
+    # Persist result
+    with get_db_context() as db:
         db_result = db.query(ImageConsultingResultDB).filter(
             ImageConsultingResultDB.user_id == user_id
         ).first()
-        
+
         if not db_result:
             db_result = ImageConsultingResultDB(user_id=user_id)
-        
+
         db_result.body_shape = result.body_shape
         db_result.face_shape = result.face_shape
         db_result.skin_tone = result.skin_tone
@@ -386,10 +555,11 @@ async def analyze_image(
         db_result.summary = result.summary
         db_result.overall_confidence = result.overall_confidence
         db_result.analyzed_at = result.analyzed_at
-        
+
         db.add(db_result)
-        
-        # Also update profile with body analysis if profile exists
+
+        # Also update user profile
+        profile = db.query(UserProfileDB).filter(UserProfileDB.user_id == user_id).first()
         if profile:
             profile.body_shape = result.body_shape
             profile.skin_tone = result.skin_tone
@@ -402,9 +572,11 @@ async def analyze_image(
                 profile.height_cm = height_cm
             if weight_kg:
                 profile.weight_kg = weight_kg
-        
+
         db.commit()
-        return result
+
+    logger.info(f"Image consulting complete for {user_id}: {result.body_shape} / {result.color_season}")
+    return result
 
 
 def get_cached_result(user_id: str) -> ImageConsultingResult:
