@@ -1,9 +1,17 @@
 """
-Explain service — rule-based outfit explanations.
+Explain service — AI-powered outfit explanations via LLM_project scoring API.
+
+Primary path:
+  1. Convert outfit garments → LLM_project Garment dicts (via llm_client)
+  2. POST /api/v1/scoring/total-style → grade, breakdown, strengths, improvements
+  3. Map response → ExplainOutfitResponse
+
+Fallback (LLM unreachable): rule-based templates (preserved below).
 """
 from __future__ import annotations
 
 import random
+import logging
 from typing import List, Optional
 
 from models.schemas import (
@@ -11,6 +19,9 @@ from models.schemas import (
     ExplainOutfitResponse,
     OutfitResult,
 )
+from services import llm_client as _llm
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Templates ───────────────────────────────────────────────
@@ -85,13 +96,13 @@ def _dim_label(key: str) -> str:
     }.get(key, key)
 
 
-def _build_explanation(
+def _fallback_explanation(
     outfit: OutfitResult,
     occasion: Optional[str],
     scoring_profile: Optional[str],
     detail_level: str,
 ) -> ExplainOutfitResponse:
-    """Generate a rich, rule-based explanation for the outfit."""
+    """Rule-based fallback when LLM project is unreachable."""
     score_dict = outfit.score.model_dump()
     overall = outfit.score.overall
 
@@ -134,7 +145,6 @@ def _build_explanation(
     )
 
     style_notes = random.sample(STYLE_NOTE_TEMPLATES, k=min(4, len(STYLE_NOTE_TEMPLATES)))
-
     styling_tips: List[str] = []
     if detail_level == "detailed":
         styling_tips = random.sample(STYLING_TIPS, k=min(3, len(STYLING_TIPS)))
@@ -149,14 +159,102 @@ def _build_explanation(
     )
 
 
+def _garment_to_dict(g) -> dict:
+    """Convert an OutfitResult garment to a plain dict for llm_client."""
+    attrs = g.attributes
+    return {
+        "id": g.id,
+        "image_url": g.image_url,
+        "attributes": {
+            "category": attrs.category if isinstance(attrs.category, str) else attrs.category.value,
+            "subcategory": attrs.subcategory,
+            "color_primary": attrs.color_primary,
+            "color_secondary": getattr(attrs, "color_secondary", None),
+            "color_hex": getattr(attrs, "color_hex", None),
+            "pattern": attrs.pattern,
+            "material": attrs.material,
+            "formality": attrs.formality,
+            "seasons": getattr(attrs, "seasons", []),
+            "confidence": attrs.confidence,
+        },
+    }
+
+
 async def explain_outfit(request: ExplainOutfitRequest) -> ExplainOutfitResponse:
-    """Generate a detailed explanation for a single outfit using rule-based logic."""
+    """
+    Generate a detailed explanation for a single outfit.
+
+    Calls LLM_project /api/v1/scoring/total-style to get an AI grade,
+    strengths, and improvements. Falls back to rule-based templates if
+    the LLM project is unreachable or returns fewer than 2 garments.
+    """
     occasion_str = request.occasion.value if request.occasion else None
     profile_str = request.scoring_profile.value if request.scoring_profile else "default"
+    outfit = request.outfit
 
-    return _build_explanation(
-        outfit=request.outfit,
-        occasion=occasion_str,
-        scoring_profile=profile_str,
-        detail_level=request.detail_level,
-    )
+    garment_dicts = [_garment_to_dict(g) for g in outfit.garments]
+
+    llm_result = {}
+    if len(garment_dicts) >= 2:
+        llm_result = _llm.explain_outfit_garments(
+            garments_dicts=garment_dicts,
+            occasion=occasion_str,
+        )
+
+    if llm_result and llm_result.get("grade"):
+        grade        = llm_result.get("grade", "B")
+        total_sc     = float(llm_result.get("total_score", outfit.score.overall * 100))
+        breakdown    = llm_result.get("breakdown") or {}
+        strengths    = llm_result.get("strengths") or []
+        improvements = llm_result.get("improvements") or []
+        summary      = llm_result.get("summary") or ""
+
+        colors = list({g.attributes.color_primary for g in outfit.garments if g.attributes.color_primary})
+        if len(colors) == 1:
+            color_note = COLOR_NOTES["monochromatic"].format(color=colors[0].title())
+        elif len(colors) == 2:
+            color_note = COLOR_NOTES["two_tone"].format(c1=colors[0].title(), c2=colors[1].title())
+        else:
+            color_note = COLOR_NOTES["multi"].format(colors=", ".join(c.title() for c in colors[:3]))
+
+        occ_label = occasion_str or "general"
+        occ_score = outfit.score.occasion_fit
+        if occ_score >= 0.80:
+            occasion_note = OCCASION_NOTES["excellent"].format(occasion=occ_label)
+        elif occ_score >= 0.60:
+            occasion_note = OCCASION_NOTES["good"].format(occasion=occ_label)
+        else:
+            occasion_note = OCCASION_NOTES["fair"].format(occasion=occ_label)
+
+        if summary:
+            detailed = summary
+        else:
+            parts = []
+            if strengths:
+                parts.append("✦ STRENGTHS\n" + "\n".join(f"• {s}" for s in strengths))
+            if improvements:
+                parts.append("✦ TO ELEVATE\n" + "\n".join(f"• {tip}" for tip in improvements))
+            detailed = "\n\n".join(parts) if parts else f"Grade {grade} — score {round(total_sc)}%"
+
+        style_notes = []
+        for k, v in (breakdown.items() if isinstance(breakdown, dict) else {}.items()):
+            if isinstance(v, (int, float)):
+                pct = round(float(v) * 100 if float(v) <= 1 else float(v))
+                style_notes.append(f"{k.replace('_', ' ').title()}: {pct}%")
+        if not style_notes:
+            style_notes = random.sample(STYLE_NOTE_TEMPLATES, k=min(4, len(STYLE_NOTE_TEMPLATES)))
+
+        styling_tips = improvements[:3] if improvements and request.detail_level == "detailed" else []
+
+        logger.info("Explain outfit %s via LLM: grade=%s score=%.0f%%", outfit.id, grade, total_sc)
+        return ExplainOutfitResponse(
+            outfit_id=outfit.id,
+            detailed=detailed,
+            style_notes=style_notes,
+            color_note=color_note,
+            occasion_note=occasion_note,
+            styling_tips=styling_tips,
+        )
+
+    logger.info("Explain outfit %s via rule-based fallback", outfit.id)
+    return _fallback_explanation(outfit, occasion_str, profile_str, request.detail_level)

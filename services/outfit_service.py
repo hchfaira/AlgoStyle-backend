@@ -1,15 +1,19 @@
 """
 Outfit service — custom outfit CRUD + AI scoring & generation.
 Uses PostgreSQL database for persistence.
+
+AI scoring (score_outfit_photo) and prompt-based generation (outfit_from_prompt)
+are delegated to the LLM_project API via llm_client.
 """
-import os
 import uuid
 import random
 import base64
+import logging
 from datetime import datetime
 from typing import List, Optional
 
-from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
+
 from fastapi import HTTPException
 from models.schemas import (
     CreateCustomOutfitRequest,
@@ -21,21 +25,8 @@ from models.schemas import (
 )
 from models.database import CustomOutfit as CustomOutfitDB
 from db import get_db_context
+from services import llm_client as _llm
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
-
-# ── Gemini Vision setup (optional) ────────────────────────────────────────
-_VISION_AVAILABLE = False
-_gemini_client = None
-try:
-    import google.generativeai as genai
-    _key = os.getenv("GOOGLE_API_KEY", "")
-    if _key:
-        genai.configure(api_key=_key)
-        _gemini_client = genai.GenerativeModel("gemini-2.5-flash")
-        _VISION_AVAILABLE = True
-except Exception:
-    pass
 
 
 # ── Serialization helper ──────────────────────────────────────────────────
@@ -217,7 +208,9 @@ def get_planned_this_week(user_id: str) -> dict:
         }
 
 
-# ── AI: Score a worn-outfit photo ─────────────────────────────────────────
+
+
+# ── AI: Score a worn-outfit photo — delegated to LLM_project ─────────────
 
 _SCORE_MOCK = {
     "overall": 0.84,
@@ -235,263 +228,39 @@ _SCORE_MOCK = {
 }
 
 
-def score_outfit_photo(user_id: str, image_bytes: bytes) -> dict:
-    """Score a worn-outfit photo and return scores + improvement tips."""
-    if _VISION_AVAILABLE and _gemini_client and image_bytes:
-        try:
-            import PIL.Image
-            import io
-            img = PIL.Image.open(io.BytesIO(image_bytes))
-            prompt = (
-                "You are a luxury fashion stylist AI. Analyse this worn outfit photo.\n"
-                "Return a JSON object with EXACTLY these keys:\n"
-                "  overall (0-1 float), color_harmony (0-1), formality_match (0-1),\n"
-                "  proportion (0-1), creativity (0-1),\n"
-                "  summary (1-sentence editorial compliment),\n"
-                "  improvements (list of 3 concise actionable tips),\n"
-                "  style_score_label (one of: Iconic / Editorial / Polished / Casual / Needs Work).\n"
-                "Respond with raw JSON only, no markdown."
-            )
-            resp = _gemini_client.generate_content([prompt, img])
-            import json, re
-            text = resp.text.strip()
-            text = re.sub(r"^```json\s*|^```\s*|```$", "", text, flags=re.MULTILINE).strip()
-            data = json.loads(text)
-            data["user_id"] = user_id
-            return data
-        except Exception:
-            pass
-
-    result = dict(_SCORE_MOCK)
-    result["user_id"] = user_id
-    result["overall"] = round(random.uniform(0.72, 0.96), 2)
-    result["color_harmony"] = round(random.uniform(0.70, 0.98), 2)
-    result["formality_match"] = round(random.uniform(0.75, 0.95), 2)
-    result["proportion"] = round(random.uniform(0.70, 0.95), 2)
-    result["creativity"] = round(random.uniform(0.40, 0.85), 2)
-    return result
-
-
-# ── AI: Build outfit from a text prompt ───────────────────────────────────
-
-_PROMPT_OUTFITS = [
-    {
-        "name": "Parisian Sunday",
-        "description": "Effortless chic for a morning at a Paris café.",
-        "pieces": [
-            {"label": "Cream linen shirt", "category": "top", "color": "#F5F0E8"},
-            {"label": "Dark navy straight trousers", "category": "bottom", "color": "#1B2A4A"},
-            {"label": "White leather loafers", "category": "shoes", "color": "#FFFFFF"},
-            {"label": "Silk square scarf", "category": "accessory", "color": "#C8A96E"},
-        ],
-        "score": 0.91,
-        "mood": "Refined & approachable",
-        "styling_tip": "Tuck the shirt loosely — half-tuck for movement.",
-    },
-]
-
-
-def outfit_from_prompt(user_id: str, prompt: str) -> dict:
-    """Generate an outfit suggestion from a text prompt using Gemini or mock data."""
-    if _VISION_AVAILABLE and _gemini_client and prompt.strip():
-        try:
-            system = (
-                "You are a luxury fashion editor AI. A user described what they want to wear.\n"
-                "Build a complete outfit suggestion as a JSON object with EXACTLY:\n"
-                "  name (string), description (string), mood (string),\n"
-                "  pieces: list of {label, category, color (hex)},\n"
-                "  score (0-1 float representing how well it matches the prompt),\n"
-                "  styling_tip (one actionable string).\n"
-                "Respond with raw JSON only, no markdown fences."
-            )
-            resp = _gemini_client.generate_content(f"{system}\n\nUser prompt: {prompt}")
-            import json, re
-            text = resp.text.strip()
-            text = re.sub(r"^```json\s*|^```\s*|```$", "", text, flags=re.MULTILINE).strip()
-            data = json.loads(text)
-            data["user_id"] = user_id
-            data["prompt"] = prompt
-            return data
-        except Exception:
-            pass
-
-    result = dict(_PROMPT_OUTFITS[0])
-    result["user_id"] = user_id
-    result["prompt"] = prompt
-    result["name"] = f"Outfit for: {prompt[:40]}"
-    result["score"] = round(random.uniform(0.80, 0.97), 2)
-    return result
-
-
-# ── Gemini Vision setup (optional) ────────────────────────────────────────
-_VISION_AVAILABLE = False
-_gemini_client = None
-try:
-    import google.generativeai as genai
-    _key = os.getenv("GOOGLE_API_KEY", "")
-    if _key:
-        genai.configure(api_key=_key)
-        _gemini_client = genai.GenerativeModel("gemini-2.5-flash")
-        _VISION_AVAILABLE = True
-except Exception:
-    pass
-
-
-def create_outfit(
-    user_id: str,
-    request: CreateCustomOutfitRequest,
-    garments: Optional[List[GarmentItem]] = None,
-) -> CustomOutfitResponse:
-    """Create a custom outfit from selected garments."""
-    with get_db_context() as db:
-        outfit = CustomOutfitDB(
-            user_id=user_id,
-            name=request.name,
-            description=request.description,
-            garment_ids=request.garment_ids,
-            is_public=request.is_public,
-        )
-        db.add(outfit)
-        db.commit()
-        
-        return CustomOutfitResponse(
-            success=True,
-            outfit=CustomOutfit(
-                id=outfit.id,
-                name=outfit.name,
-                description=outfit.description,
-                garments=garments or [],
-                is_public=outfit.is_public,
-                created_at=outfit.created_at,
-                updated_at=outfit.updated_at,
-            ),
-            message=f"Outfit '{outfit.name}' created successfully!",
-        )
-
-
-def list_outfits(user_id: str) -> dict:
-    """Get all custom outfits for a user."""
-    with get_db_context() as db:
-        outfits = db.query(CustomOutfitDB).filter(CustomOutfitDB.user_id == user_id).all()
-        return {
-            "outfits": [
-                CustomOutfit(
-                    id=o.id,
-                    name=o.name,
-                    description=o.description,
-                    garments=[],
-                    is_public=o.is_public,
-                    created_at=o.created_at,
-                    updated_at=o.updated_at,
-                ).model_dump()
-                for o in outfits
-            ],
-            "total": len(outfits),
-        }
-
-
-def get_outfit(user_id: str, outfit_id: str) -> CustomOutfit:
-    """Get a specific custom outfit."""
-    with get_db_context() as db:
-        outfit = db.query(CustomOutfitDB).filter(
-            CustomOutfitDB.id == outfit_id,
-            CustomOutfitDB.user_id == user_id
-        ).first()
-        if not outfit:
-            raise HTTPException(404, "Outfit not found")
-        
-        return CustomOutfit(
-            id=outfit.id,
-            name=outfit.name,
-            description=outfit.description,
-            garments=[],
-            is_public=outfit.is_public,
-            created_at=outfit.created_at,
-            updated_at=outfit.updated_at,
-        )
-
-
-def delete_outfit(user_id: str, outfit_id: str) -> dict:
-    """Delete a custom outfit."""
-    with get_db_context() as db:
-        outfit = db.query(CustomOutfitDB).filter(
-            CustomOutfitDB.id == outfit_id,
-            CustomOutfitDB.user_id == user_id
-        ).first()
-        if not outfit:
-            raise HTTPException(404, "Outfit not found")
-        
-        outfit_name = outfit.name
-        db.delete(outfit)
-        db.commit()
-        
-        return {"success": True, "message": f"Outfit '{outfit_name}' deleted successfully!"}
-
-
-def share_outfit(user_id: str, outfit_id: str) -> dict:
-    """Generate a shareable link for a custom outfit."""
-    with get_db_context() as db:
-        outfit = db.query(CustomOutfitDB).filter(
-            CustomOutfitDB.id == outfit_id,
-            CustomOutfitDB.user_id == user_id
-        ).first()
-        if not outfit:
-            raise HTTPException(404, "Outfit not found")
-        
-        import uuid
-        share_code = str(uuid.uuid4())[:8]
-        return {
-            "success": True,
-            "share_code": share_code,
-            "share_url": f"https://algostyle.app/shared-outfit/{share_code}",
-            "outfit_name": outfit.name,
-        }
-
-
-# ── AI: Score a worn-outfit photo ─────────────────────────────────────────
-
-_SCORE_MOCK = {
-    "overall": 0.84,
-    "color_harmony": 0.88,
-    "formality_match": 0.80,
-    "proportion": 0.82,
-    "creativity": 0.74,
-    "summary": "Strong color story with good proportions. The layering adds dimension.",
-    "improvements": [
-        "Try a belt to define the waist and add structure.",
-        "Swap the white sneakers for a tan leather loafer to elevate formality.",
-        "A slim watch in gold would tie the warm tones together beautifully.",
-    ],
-    "style_score_label": "Editorial",
-}
+def _grade_label(score: float) -> str:
+    """Convert a 0–1 overall score to a human-readable grade label."""
+    if score >= 0.93: return "Iconic"
+    if score >= 0.86: return "Editorial"
+    if score >= 0.78: return "Polished"
+    if score >= 0.68: return "Casual Chic"
+    if score >= 0.55: return "Everyday"
+    return "Work in Progress"
 
 
 def score_outfit_photo(user_id: str, image_bytes: bytes) -> dict:
-    """Score a worn-outfit photo and return scores + improvement tips."""
-    if _VISION_AVAILABLE and _gemini_client and image_bytes:
-        try:
-            import PIL.Image
-            import io
-            img = PIL.Image.open(io.BytesIO(image_bytes))
-            prompt = (
-                "You are a luxury fashion stylist AI. Analyse this worn outfit photo.\n"
-                "Return a JSON object with EXACTLY these keys:\n"
-                "  overall (0-1 float), color_harmony (0-1), formality_match (0-1),\n"
-                "  proportion (0-1), creativity (0-1),\n"
-                "  summary (1-sentence editorial compliment),\n"
-                "  improvements (list of 3 concise actionable tips),\n"
-                "  style_score_label (one of: Iconic / Editorial / Polished / Casual / Needs Work).\n"
-                "Respond with raw JSON only, no markdown."
-            )
-            resp = _gemini_client.generate_content([prompt, img])
-            import json, re
-            text = resp.text.strip()
-            text = re.sub(r"^```json\s*|^```\s*|```$", "", text, flags=re.MULTILINE).strip()
-            data = json.loads(text)
-            data["user_id"] = user_id
-            return data
-        except Exception as e:
-            pass  # fall through to mock
+    """
+    Score a worn-outfit photo via LLM_project pipeline (Layer 2 scoring).
+    Falls back to mock scores if the LLM project is unreachable.
+    """
+    llm_result = _llm.score_outfit_photo(image_bytes)
+    if llm_result:
+        # Pipeline returns {"recommendations": [{"overall_score", "score_breakdown", "explanation", ...}]}
+        recs = llm_result.get("recommendations") or []
+        top = recs[0] if recs else {}
+        breakdown = top.get("score_breakdown") or {}
+        result = {
+            "overall":           top.get("overall_score", 0.84),
+            "color_harmony":     breakdown.get("color_harmony", breakdown.get("season_color", 0.88)),
+            "formality_match":   breakdown.get("formality", breakdown.get("occasion", 0.80)),
+            "proportion":        breakdown.get("proportion", 0.82),
+            "creativity":        breakdown.get("creativity", 0.74),
+            "summary":           top.get("explanation") or _SCORE_MOCK["summary"],
+            "improvements":      _SCORE_MOCK["improvements"],
+            "style_score_label": _grade_label(top.get("overall_score", 0.84)),
+            "user_id":           user_id,
+        }
+        return result
 
     # Mock fallback
     result = dict(_SCORE_MOCK)
@@ -504,7 +273,7 @@ def score_outfit_photo(user_id: str, image_bytes: bytes) -> dict:
     return result
 
 
-# ── AI: Build outfit from a text prompt ───────────────────────────────────
+# ── AI: Build outfit from a text prompt — delegated to LLM_project ───────
 
 _PROMPT_OUTFITS = [
     {
@@ -524,30 +293,63 @@ _PROMPT_OUTFITS = [
 
 
 def outfit_from_prompt(user_id: str, prompt: str) -> dict:
-    """Generate an outfit suggestion from a text prompt using Gemini or mock data."""
-    if _VISION_AVAILABLE and _gemini_client and prompt.strip():
-        try:
-            system = (
-                "You are a luxury fashion editor AI. A user described what they want to wear.\n"
-                "Build a complete outfit suggestion as a JSON object with EXACTLY:\n"
-                "  name (string), description (string), mood (string),\n"
-                "  pieces: list of {label, category, color (hex)},\n"
-                "  score (0-1 float representing how well it matches the prompt),\n"
-                "  styling_tip (one actionable string).\n"
-                "Respond with raw JSON only, no markdown fences."
-            )
-            resp = _gemini_client.generate_content(
-                f"{system}\n\nUser prompt: {prompt}"
-            )
-            import json, re
-            text = resp.text.strip()
-            text = re.sub(r"^```json\s*|^```\s*|```$", "", text, flags=re.MULTILINE).strip()
-            data = json.loads(text)
-            data["user_id"] = user_id
-            data["prompt"] = prompt
-            return data
-        except Exception:
-            pass
+    """
+    Generate an outfit suggestion from a natural-language prompt.
+    Fetches the user's wardrobe image_urls, sends them + the prompt to
+    LLM_project pipeline (Layer 2+3+4), maps the top recommendation.
+    Falls back to mock if the LLM project is unreachable or wardrobe is empty.
+    """
+    # Pull image URLs from wardrobe
+    from models.database import GarmentItem as GarmentItemDB
+    wardrobe_b64s: list[str] = []
+    try:
+        with get_db_context() as db:
+            items = db.query(GarmentItemDB).filter(
+                GarmentItemDB.user_id == user_id,
+                GarmentItemDB.image_url.isnot(None),
+            ).limit(20).all()
+            for item in items:
+                url = item.image_url or ""
+                if url.startswith("data:"):
+                    # data:<mime>;base64,<data>  →  extract base64 part
+                    b64 = url.split(",", 1)[-1] if "," in url else ""
+                    if b64:
+                        wardrobe_b64s.append(b64)
+    except Exception as e:
+        logger.warning("Could not fetch wardrobe for prompt: %s", e)
+
+    if not wardrobe_b64s:
+        # No wardrobe — return mock directly (nothing to style)
+        result = dict(_PROMPT_OUTFITS[0])
+        result["user_id"] = user_id
+        result["prompt"] = prompt
+        result["name"] = f"Outfit for: {prompt[:40]}"
+        result["score"] = round(random.uniform(0.80, 0.97), 2)
+        return result
+
+    llm_result = _llm.outfit_from_prompt(prompt, wardrobe_b64s)
+    if llm_result:
+        # Pipeline returns {"recommendations": [{"name", "overall_score", "garments", "explanation", ...}]}
+        recs = llm_result.get("recommendations") or []
+        pieces = []
+        for rec in recs:
+            for g in (rec.get("garments") or []):
+                pieces.append({
+                    "label":    g.get("subcategory") or g.get("category", ""),
+                    "category": g.get("category", ""),
+                    "color":    g.get("color_primary") or "#888888",
+                })
+        first = recs[0] if recs else {}
+        return {
+            "user_id":     user_id,
+            "prompt":      prompt,
+            "name":        first.get("name") or f"Outfit for: {prompt[:40]}",
+            "description": first.get("explanation") or "",
+            "mood":        "",
+            "pieces":      pieces,
+            "score":       first.get("overall_score", round(random.uniform(0.80, 0.97), 2)),
+            "styling_tip": "",
+        }
 
     # Mock fallback
     result = dict(_PROMPT_OUTFITS[0])

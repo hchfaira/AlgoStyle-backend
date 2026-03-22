@@ -154,6 +154,11 @@ class GarmentItem(BaseModel):
     tags: List[str] = Field(default_factory=list)
     times_worn: int = 0
     last_worn: Optional[datetime] = None
+    # Cost-per-wear
+    purchase_price: Optional[float] = None
+    worn_count: int = 0
+    # LLM-native attributes stored verbatim — used by llm_client to skip re-mapping
+    llm_attributes: Optional[dict] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -192,6 +197,9 @@ class GarmentExtractionResult(BaseModel):
     confidence: float = 0.0
     # Base64-encoded cropped garment image (optional — for preview)
     cropped_image_b64: Optional[str] = None
+    # LLM-native attributes dict — stored verbatim so add_garment() can
+    # persist it in the llm_attributes column, skipping re-conversion later.
+    llm_attributes: Optional[dict] = None
 
 
 # ─── Recommendation Models ───────────────────────────────────
@@ -418,3 +426,74 @@ class ExplainOutfitResponse(BaseModel):
     color_note: Optional[str] = None
     occasion_note: Optional[str] = None
     styling_tips: List[str] = Field(default_factory=list)
+
+
+# ─── Wardrobe Insights Models ─────────────────────────────────
+
+class GapItem(BaseModel):
+    """A single wardrobe gap (missing foundation piece)."""
+    gap_type: str                  # category_missing, color_imbalance, formality_gap, season_gap
+    severity: str                  # low, medium, high
+    description: str
+    recommendation: str
+
+
+class OccasionCoverageItem(BaseModel):
+    """Coverage for a single occasion."""
+    occasion: str
+    coverage_score: float          # 0-1
+    suitable_items_count: int
+    missing_categories: List[str] = Field(default_factory=list)
+    suggestion: Optional[str] = None
+
+
+class VersatilityItem(BaseModel):
+    """Versatility stats for a single garment."""
+    garment_id: str
+    garment_description: str
+    versatility_score: float       # 0-1
+    compatible_outfit_count: int
+    compatible_categories: List[str] = Field(default_factory=list)
+    compatible_occasions: List[str] = Field(default_factory=list)
+
+
+class DuplicateGroup(BaseModel):
+    """A group of near-identical garments."""
+    garment_ids: List[str]
+    descriptions: List[str]
+    shared_category: str
+    shared_color: str
+    shared_pattern: str
+    similarity_score: float        # 0-1
+    recommendation: str            # e.g. "Keep the most versatile, consider selling the others"
+
+
+class CostPerWearItem(BaseModel):
+    """Cost-per-wear ranking for a single garment."""
+    garment_id: str
+    garment_description: str
+    purchase_price: float
+    worn_count: int
+    cost_per_wear: float           # purchase_price / max(worn_count, 1)
+    value_tier: str                # excellent, good, fair, poor, unworn
+
+
+class WardrobeInsightsResponse(BaseModel):
+    """Full wardrobe insights — all 5 features in one response."""
+    # 1. Capsule gap analysis
+    gaps: List[GapItem] = Field(default_factory=list)
+    # 2. Cost-per-wear
+    cost_per_wear: List[CostPerWearItem] = Field(default_factory=list)
+    has_price_data: bool = False   # false when no garments have purchase_price
+    # 3. Duplicate detection
+    duplicate_groups: List[DuplicateGroup] = Field(default_factory=list)
+    total_duplicates: int = 0
+    # 4. Occasion coverage
+    occasion_coverage: List[OccasionCoverageItem] = Field(default_factory=list)
+    overall_coverage_score: float = 0.0
+    # 5. Versatility ranking
+    versatility_ranking: List[VersatilityItem] = Field(default_factory=list)
+    # Summary
+    overall_score: float = 0.0
+    summary: str = ""
+    cached: bool = False

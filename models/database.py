@@ -112,11 +112,41 @@ class GarmentItem(Base):
     tags = Column(ARRAY(String), default=[])
     times_worn = Column(Integer, default=0)
     last_worn = Column(DateTime, nullable=True)
-    
+
+    # Cost-per-wear tracking
+    purchase_price = Column(Float, nullable=True)   # optional, entered by user
+    worn_count = Column(Integer, default=0)          # incremented when outfit is worn
+
+    # LLM-native attributes — stored verbatim from LLM_project /analyze/image response.
+    # Shape: { category, subcategory, color: {primary, secondary, hex_codes},
+    #          pattern: {type}, material: {primary}, formality_level,
+    #          confidence_score, season_suitable }
+    # When present, llm_client._algogarment_to_llm() uses this directly,
+    # eliminating the flat-column → nested-object conversion.
+    llm_attributes = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     user = relationship("User", back_populates="garments")
+
+
+class WardrobeAnalysisCache(Base):
+    """Persisted wardrobe analysis cache — one row per user.
+
+    is_dirty=True means the wardrobe changed since the last LLM run.
+    get_wardrobe_insights() skips the LLM call when is_dirty=False and
+    result_json is populated, returning the stored JSON directly.
+    Mark dirty by calling mark_wardrobe_dirty(user_id) whenever a garment
+    is added, updated, or deleted.
+    """
+    __tablename__ = "wardrobe_analysis_cache"
+
+    user_id     = Column(String, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    result_json = Column(JSON, nullable=True)   # full WardrobeInsightsResponse dict
+    is_dirty    = Column(Boolean, default=True) # True → recompute on next read
+    cached_at   = Column(DateTime, nullable=True)
+    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class CustomOutfit(Base):

@@ -28,10 +28,8 @@ def create_test_users():
         # Create test user
         test_user = User(
             email="test@algostyle.com",
-            hashed_password=hash_password("Test123!"),
-            first_name="Test",
-            last_name="User",
-            is_active=True,
+            name="Test User",
+            password_hash=hash_password("Test123!"),
         )
         db.add(test_user)
         db.flush()  # Get the ID without committing
@@ -42,7 +40,6 @@ def create_test_users():
             user_id=user_id,
             height_cm=170,
             weight_kg=65,
-            bio="Test user for development",
         )
         db.add(test_profile)
         db.commit()

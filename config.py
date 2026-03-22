@@ -12,20 +12,25 @@ class Settings(BaseSettings):
     # Environment
     environment: str = "development"  # development, staging, production
     
-    # Database
-    database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/algostyle"
+    # Database — no default, must be set in .env
+    database_url: str
     
-    # Google Gemini API
-    google_api_key: str = ""
+    # Google Gemini API — no default, must be set in .env
+    google_api_key: str
+
+    # LLM_project API — AI vision, scoring, prompt-search
+    # Set to "" to disable and use the fallback mock inside each service.
+    llm_api_url: str = ""
 
     # Neo4j (shared with LLM_project — garment graph)
-    neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = "neo4j_password_123"
+    # Leave empty to disable Neo4j integration
+    neo4j_uri: str = ""
+    neo4j_user: str = ""
+    neo4j_password: str = ""
     neo4j_database: str = "neo4j"
 
     # CORS Configuration
-    cors_origins: str = "http://localhost:3000,http://localhost:8081,http://192.168.1.71:8000"
+    cors_origins: str = ""
     cors_credentials: bool = True
     cors_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
     cors_headers: List[str] = ["*"]
@@ -59,7 +64,9 @@ class Settings(BaseSettings):
                 "http://localhost:8081",
             ]
         else:
-            # Development: parse from env var or use defaults
+            # Development: parse from env var — must be set in .env
+            if not self.cors_origins:
+                raise ValueError("CORS_ORIGINS must be set in .env for development environment")
             return [origin.strip() for origin in self.cors_origins.split(",")]
 
 

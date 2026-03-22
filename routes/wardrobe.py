@@ -1,8 +1,9 @@
 """
 Wardrobe routes — thin handlers delegating to wardrobe_service.
 """
+import json
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
-from models.schemas import GarmentItem, GarmentExtractionResult
+from models.schemas import GarmentItem, GarmentExtractionResult, WardrobeInsightsResponse
 from typing import Optional, List
 from services import wardrobe_service
 
@@ -38,12 +39,16 @@ async def add_garment(
     pattern: Optional[str] = Query(default=None),
     material: Optional[str] = Query(default=None),
     formality: Optional[str] = Query(default=None),
+    purchase_price: Optional[float] = Query(default=None, description="Optional purchase price for cost-per-wear tracking"),
+    llm_attributes_json: Optional[str] = Query(default=None, description="JSON-encoded LLM-native attributes from analyze-image response"),
     image: Optional[UploadFile] = File(default=None),
 ):
     """
     Save a confirmed garment to the wardrobe.
     All garment attributes come as query params.
     Image is optional multipart — stored if provided.
+    llm_attributes_json: JSON string of the llm_attributes field from the
+    analyze-image response — stored verbatim to skip re-conversion on future LLM calls.
     """
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
@@ -58,8 +63,17 @@ async def add_garment(
         "pattern": pattern,
         "material": material,
         "formality": formality,
+        "purchase_price": purchase_price,
     }
-    return wardrobe_service.add_garment(user_id, category, image_bytes, extra_attrs=attrs)
+    llm_attrs: Optional[dict] = None
+    if llm_attributes_json:
+        try:
+            llm_attrs = json.loads(llm_attributes_json)
+        except Exception:
+            pass  # ignore malformed JSON — fall back to slow path
+    result = wardrobe_service.add_garment(user_id, category, image_bytes, extra_attrs=attrs, llm_attributes=llm_attrs)
+    wardrobe_service.mark_wardrobe_dirty(user_id)
+    return result
 
 
 @router.get("/items", response_model=List[GarmentItem])
@@ -87,12 +101,16 @@ async def get_garment(user_id: str, garment_id: str):
 
 @router.put("/items/{garment_id}", response_model=GarmentItem)
 async def update_garment(user_id: str, garment_id: str, updates: dict):
-    return wardrobe_service.update_garment(user_id, garment_id, updates)
+    result = wardrobe_service.update_garment(user_id, garment_id, updates)
+    wardrobe_service.mark_wardrobe_dirty(user_id)
+    return result
 
 
 @router.delete("/items/{garment_id}")
 async def delete_garment(user_id: str, garment_id: str):
-    return wardrobe_service.delete_garment(user_id, garment_id)
+    result = wardrobe_service.delete_garment(user_id, garment_id)
+    wardrobe_service.mark_wardrobe_dirty(user_id)
+    return result
 
 
 @router.post("/items/{garment_id}/favorite")
@@ -168,3 +186,22 @@ async def capsule_generate(
 ):
     """Generate an optimised capsule for a given occasion and/or season."""
     return wardrobe_service.generate_capsule(user_id, occasion, season)
+
+
+# ── Wardrobe Insights (5 AI features) ───────────────────────
+
+@router.get("/insights", response_model=WardrobeInsightsResponse)
+async def wardrobe_insights(
+    user_id: str,
+    refresh: bool = Query(False, description="Set true to bypass 15-minute cache"),
+):
+    """
+    Returns all 5 wardrobe intelligence features in one call:
+      1. Capsule gap analysis — missing foundation pieces
+      2. Cost-per-wear ranking — value of each priced garment
+      3. Duplicate detection — near-identical items flagged
+      4. Occasion coverage — heatmap of occasion gaps
+      5. Versatility ranking — most/least outfit-pairable garments
+    Cached 15 minutes per user.
+    """
+    return wardrobe_service.get_wardrobe_insights(user_id, refresh=refresh)
