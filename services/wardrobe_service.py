@@ -25,7 +25,7 @@ from models.schemas import (
     WardrobeInsightsResponse, GapItem, OccasionCoverageItem,
     VersatilityItem, DuplicateGroup, CostPerWearItem,
 )
-from models.database import GarmentItem as GarmentItemDB, WardrobeAnalysisCache as WACacheDB
+from models.database import GarmentItem as GarmentItemDB, WardrobeAnalysisCache as WACacheDB, CustomOutfit as CustomOutfitDB
 from db import get_db_context
 from services import neo4j_service
 from services import llm_client as _llm
@@ -548,7 +548,7 @@ def update_garment(user_id: str, garment_id: str, updates: dict) -> GarmentItem:
 
 
 def delete_garment(user_id: str, garment_id: str) -> dict:
-    """Delete a garment from PostgreSQL and Neo4j."""
+    """Delete a garment from PostgreSQL and Neo4j, and clean up outfit references."""
     with get_db_context() as db:
         garment = db.query(GarmentItemDB).filter(
             GarmentItemDB.id == garment_id,
@@ -557,6 +557,19 @@ def delete_garment(user_id: str, garment_id: str) -> dict:
         if not garment:
             raise HTTPException(404, "Garment not found")
         db.delete(garment)
+
+        # Remove this garment ID from any outfit that references it
+        outfits = (
+            db.query(CustomOutfitDB)
+            .filter(
+                CustomOutfitDB.user_id == user_id,
+                CustomOutfitDB.garment_ids.any(garment_id),
+            )
+            .all()
+        )
+        for outfit in outfits:
+            outfit.garment_ids = [gid for gid in outfit.garment_ids if gid != garment_id]
+
         db.commit()
     # ── Remove from Neo4j (fire-and-forget) ──────────────
     neo4j_service.delete_garment(garment_id)

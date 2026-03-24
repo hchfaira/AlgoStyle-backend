@@ -4,7 +4,7 @@ All operations are fire-and-forget: failures are logged but never crash the main
 """
 import os
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,27 @@ def upsert_garment(garment_id: str, user_id: str, attrs: Dict) -> None:
             )
     except Exception as e:
         logger.warning("Neo4j upsert_garment failed for %s: %s", garment_id, e)
+
+
+def get_garments_by_ids(garment_ids: list) -> dict:
+    """
+    Fetch garment properties from Neo4j by a list of IDs.
+    Returns a dict keyed by garment id: {id: {field: value, ...}}.
+    Falls back to an empty dict if Neo4j is unavailable.
+    """
+    driver = _get_driver()
+    if not driver or not garment_ids:
+        return {}
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (g:Garment) WHERE g.id IN $ids RETURN g",
+                ids=garment_ids,
+            )
+            return {record["g"]["id"]: dict(record["g"]) for record in result}
+    except Exception as e:
+        logger.warning("Neo4j get_garments_by_ids failed: %s", e)
+        return {}
 
 
 def delete_garment(garment_id: str) -> None:

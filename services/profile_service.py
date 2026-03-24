@@ -43,6 +43,8 @@ def get_profile(user_id: str) -> UserProfile:
             budget=profile.budget,
             location=profile.location,
             timezone=profile.timezone,
+            bio=profile.bio,
+            is_public=profile.is_public if profile.is_public is not None else True,
             is_onboarded=profile.user.is_onboarded if profile.user else False,
             created_at=profile.created_at,
         )
@@ -83,6 +85,8 @@ def update_profile(user_id: str, update: OnboardingUpdate) -> UserProfile:
             budget=profile.budget,
             location=profile.location,
             timezone=profile.timezone,
+            bio=profile.bio,
+            is_public=profile.is_public if profile.is_public is not None else True,
             is_onboarded=user.is_onboarded,
             created_at=profile.created_at,
         )

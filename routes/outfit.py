@@ -53,6 +53,12 @@ async def share_custom_outfit(user_id: str, outfit_id: str):
     return outfit_service.share_outfit(user_id, outfit_id)
 
 
+@router.post("/{outfit_id}/publish", response_model=dict)
+async def publish_outfit(user_id: str, outfit_id: str):
+    """Publish an outfit to the community People feed (sets is_public=True)."""
+    return outfit_service.publish_outfit(user_id, outfit_id)
+
+
 @router.post("/score-photo", response_model=dict)
 async def score_outfit_photo(
     user_id: str,

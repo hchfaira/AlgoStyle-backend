@@ -77,7 +77,10 @@ class UserProfile(Base):
     # Location
     location = Column(String, nullable=True)
     timezone = Column(String, nullable=True)
-    
+
+    bio = Column(String, nullable=True)
+    is_public = Column(Boolean, default=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -185,6 +188,26 @@ class CustomOutfit(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="custom_outfits")
+
+
+class OutfitLike(Base):
+    """A user liking a public outfit post."""
+    __tablename__ = "outfit_likes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    outfit_id = Column(String, ForeignKey("custom_outfits.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OutfitSave(Base):
+    """A user saving/bookmarking a public outfit post."""
+    __tablename__ = "outfit_saves"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    outfit_id = Column(String, ForeignKey("custom_outfits.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ChatSession(Base):

@@ -113,6 +113,9 @@ class UserProfile(BaseModel):
     location: Optional[str] = None
     timezone: Optional[str] = None
 
+    bio: Optional[str] = None
+    is_public: bool = True
+
     is_onboarded: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -127,6 +130,7 @@ class OnboardingUpdate(BaseModel):
     comfort_vs_style: Optional[int] = None
     budget: Optional[str] = None
     location: Optional[str] = None
+    bio: Optional[str] = None
 
 
 # ─── Wardrobe Models ─────────────────────────────────────────
@@ -497,3 +501,55 @@ class WardrobeInsightsResponse(BaseModel):
     overall_score: float = 0.0
     summary: str = ""
     cached: bool = False
+
+
+# ─── Social / Community Feed Models ──────────────────────────
+
+class UserStats(BaseModel):
+    outfits_shared: int = 0
+    likes_received: int = 0
+
+class SocialFeedItem(BaseModel):
+    """A single garment item in a social feed post (minimal representation)."""
+    id: str
+    color: str = "#888888"       # color_hex from garment
+    color_name: Optional[str] = None   # e.g. "navy", "black"
+    category: str                # top, bottom, shoes, etc.
+    subcategory: Optional[str] = None  # shirt, jeans, sneakers, etc.
+    material: Optional[str] = None     # e.g. "cotton", "leather"
+    image_url: Optional[str] = None
+
+
+class SocialFeedPost(BaseModel):
+    """A public outfit as shown in the community People feed."""
+    id: str                      # outfit_id
+    user_id: str
+    user_name: str
+    outfit_name: str
+    description: Optional[str] = None
+    items: List[SocialFeedItem] = Field(default_factory=list)
+    ai_grade: Optional[str] = None
+    ai_score: Optional[float] = None
+    source: str = "build"        # build | ai | score | prompt
+    likes: int = 0
+    saves: int = 0
+    comments: int = 0
+    liked: bool = False          # liked by requesting user
+    saved: bool = False          # saved by requesting user
+    created_at: Optional[datetime] = None
+
+
+class SocialFeedResponse(BaseModel):
+    posts: List[SocialFeedPost]
+    total: int
+    has_more: bool = False
+
+
+class ToggleLikeResponse(BaseModel):
+    liked: bool
+    likes: int
+
+
+class ToggleSaveResponse(BaseModel):
+    saved: bool
+    saves: int

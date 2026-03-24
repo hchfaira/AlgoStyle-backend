@@ -23,9 +23,10 @@ from models.schemas import (
     GarmentItem,
     ReminderSetting,
 )
-from models.database import CustomOutfit as CustomOutfitDB
+from models.database import CustomOutfit as CustomOutfitDB, GarmentItem as GarmentItemDB
 from db import get_db_context
 from services import llm_client as _llm
+from services import neo4j_service as _neo4j
 
 
 
@@ -57,6 +58,68 @@ def _db_to_schema(o: CustomOutfitDB, garments: Optional[List[GarmentItem]] = Non
         updated_at=o.updated_at,
     )
 
+# ── Garment resolution ────────────────────────────────────────────────────
+
+def _resolve_garments(garment_ids: List[str], db) -> List[GarmentItem]:
+    """
+    Fetch garment details for the given IDs.
+    Prefers Neo4j; falls back to PostgreSQL for any IDs not found in the graph.
+    """
+    if not garment_ids:
+        return []
+
+    neo4j_map = _neo4j.get_garments_by_ids(garment_ids)
+
+    missing_ids = [gid for gid in garment_ids if gid not in neo4j_map]
+    pg_map: dict = {}
+    if missing_ids:
+        pg_rows = db.query(GarmentItemDB).filter(GarmentItemDB.id.in_(missing_ids)).all()
+        pg_map = {g.id: g for g in pg_rows}
+
+    garments: List[GarmentItem] = []
+    for gid in garment_ids:
+        if gid in neo4j_map:
+            n = neo4j_map[gid]
+            try:
+                garments.append(
+                    GarmentItem(
+                        id=gid,
+                        user_id=n.get("user_id", ""),
+                        image_url=n.get("image_url") or None,
+                        attributes={
+                            "category": n.get("category", "other"),
+                            "subcategory": n.get("subcategory") or None,
+                            "color_primary": n.get("color", "unknown"),
+                            "color_hex": n.get("color_hex") or None,
+                            "pattern": n.get("pattern", "solid"),
+                            "material": n.get("material") or None,
+                            "formality": n.get("formality", "casual"),
+                        },
+                    )
+                )
+            except Exception:
+                pass  # malformed node — skip
+        elif gid in pg_map:
+            g = pg_map[gid]
+            try:
+                garments.append(
+                    GarmentItem(
+                        id=g.id,
+                        user_id=g.user_id,
+                        image_url=g.image_url,
+                        attributes=g.attributes if isinstance(g.attributes, dict) else g.attributes,
+                        is_favorite=g.is_favorite or False,
+                        for_sale=g.for_sale or False,
+                        tags=g.tags or [],
+                        times_worn=g.times_worn or 0,
+                        purchase_price=g.purchase_price,
+                        worn_count=g.worn_count or 0,
+                        created_at=g.created_at,
+                    )
+                )
+            except Exception:
+                pass
+    return garments
 
 # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -86,9 +149,10 @@ def create_outfit(
         db.commit()
         db.refresh(outfit)
 
+        resolved = garments or _resolve_garments(request.garment_ids, db)
         return CustomOutfitResponse(
             success=True,
-            outfit=_db_to_schema(outfit, garments),
+            outfit=_db_to_schema(outfit, resolved),
             message=f"Outfit '{outfit.name}' created successfully!",
         )
 
@@ -108,8 +172,62 @@ def list_outfits(user_id: str, upcoming_only: bool = False, past_only: bool = Fa
             q = q.order_by(CustomOutfitDB.planned_date.asc().nullslast(), CustomOutfitDB.created_at.desc())
 
         outfits = q.all()
+        # Batch-resolve garments from Neo4j (PG fallback) for all outfits
+        all_ids = list({gid for o in outfits for gid in (o.garment_ids or [])})
+        all_ids_map: dict = {}
+        if all_ids:
+            neo4j_batch = _neo4j.get_garments_by_ids(all_ids)
+            pg_missing = [gid for gid in all_ids if gid not in neo4j_batch]
+            pg_rows = db.query(GarmentItemDB).filter(GarmentItemDB.id.in_(pg_missing)).all() if pg_missing else []
+            pg_batch = {g.id: g for g in pg_rows}
+
+            def _build_garment(gid: str) -> Optional[GarmentItem]:
+                if gid in neo4j_batch:
+                    n = neo4j_batch[gid]
+                    try:
+                        return GarmentItem(
+                            id=gid, user_id=n.get("user_id", ""),
+                            image_url=n.get("image_url") or None,
+                            attributes={
+                                "category": n.get("category", "other"),
+                                "subcategory": n.get("subcategory") or None,
+                                "color_primary": n.get("color", "unknown"),
+                                "color_hex": n.get("color_hex") or None,
+                                "pattern": n.get("pattern", "solid"),
+                                "material": n.get("material") or None,
+                                "formality": n.get("formality", "casual"),
+                            },
+                        )
+                    except Exception:
+                        return None
+                if gid in pg_batch:
+                    g = pg_batch[gid]
+                    try:
+                        return GarmentItem(
+                            id=g.id, user_id=g.user_id,
+                            image_url=g.image_url,
+                            attributes=g.attributes if isinstance(g.attributes, dict) else g.attributes,
+                            is_favorite=g.is_favorite or False,
+                            for_sale=g.for_sale or False,
+                            tags=g.tags or [],
+                            times_worn=g.times_worn or 0,
+                            purchase_price=g.purchase_price,
+                            worn_count=g.worn_count or 0,
+                            created_at=g.created_at,
+                        )
+                    except Exception:
+                        return None
+                return None
+
+            all_ids_map = {
+                gid: g for gid in all_ids if (g := _build_garment(gid)) is not None
+            }
+
+        def _garments_for(o: CustomOutfitDB) -> List[GarmentItem]:
+            return [all_ids_map[gid] for gid in (o.garment_ids or []) if gid in all_ids_map]
+
         return {
-            "outfits": [_db_to_schema(o).model_dump(mode="json") for o in outfits],
+            "outfits": [_db_to_schema(o, _garments_for(o)).model_dump(mode="json") for o in outfits],
             "total": len(outfits),
         }
 
@@ -123,7 +241,8 @@ def get_outfit(user_id: str, outfit_id: str) -> CustomOutfit:
         ).first()
         if not outfit:
             raise HTTPException(404, "Outfit not found")
-        return _db_to_schema(outfit)
+        garments = _resolve_garments(outfit.garment_ids or [], db)
+        return _db_to_schema(outfit, garments)
 
 
 def update_outfit_plan(user_id: str, outfit_id: str, patch: UpdateOutfitPlanRequest) -> CustomOutfit:
@@ -184,6 +303,21 @@ def share_outfit(user_id: str, outfit_id: str) -> dict:
             "share_url": f"https://algostyle.app/shared-outfit/{share_code}",
             "outfit_name": outfit.name,
         }
+
+
+def publish_outfit(user_id: str, outfit_id: str) -> dict:
+    """Mark a custom outfit as public so it appears in the community People feed."""
+    with get_db_context() as db:
+        outfit = db.query(CustomOutfitDB).filter(
+            CustomOutfitDB.id == outfit_id,
+            CustomOutfitDB.user_id == user_id
+        ).first()
+        if not outfit:
+            raise HTTPException(404, "Outfit not found")
+        outfit.is_public = True
+        outfit.updated_at = datetime.utcnow()
+        db.commit()
+        return {"success": True, "message": f"'{outfit.name}' is now visible in the community feed."}
 
 
 def get_planned_this_week(user_id: str) -> dict:
