@@ -31,6 +31,20 @@ class User(Base):
     consulting_results = relationship("ImageConsultingResult", back_populates="user", cascade="all, delete-orphan")
     tokens = relationship("UserToken", back_populates="user", cascade="all, delete-orphan")
 
+    # Follow relationships
+    followers = relationship(
+        "UserFollow",
+        foreign_keys="UserFollow.following_id",
+        back_populates="following_user",
+        cascade="all, delete-orphan",
+    )
+    following = relationship(
+        "UserFollow",
+        foreign_keys="UserFollow.follower_id",
+        back_populates="follower_user",
+        cascade="all, delete-orphan",
+    )
+
 
 class UserToken(Base):
     """Authentication tokens - one-to-many relationship."""
@@ -208,6 +222,25 @@ class OutfitSave(Base):
     outfit_id = Column(String, ForeignKey("custom_outfits.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UserFollow(Base):
+    """A follow relationship between two users.
+
+    status:
+      - 'accepted'  – the follow is active
+      - 'pending'   – the target has a private account; awaiting approval
+    """
+    __tablename__ = "user_follows"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    follower_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    following_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String, default="accepted")  # accepted | pending
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    follower_user = relationship("User", foreign_keys=[follower_id], back_populates="following")
+    following_user = relationship("User", foreign_keys=[following_id], back_populates="followers")
 
 
 class ChatSession(Base):

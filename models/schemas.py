@@ -553,3 +553,60 @@ class ToggleLikeResponse(BaseModel):
 class ToggleSaveResponse(BaseModel):
     saved: bool
     saves: int
+
+
+# ─── Follow / Social Connection Models ───────────────────────
+
+class FollowResponse(BaseModel):
+    """Returned after follow / unfollow actions."""
+    status: str  # accepted | pending | unfollowed
+    followers_count: int = 0
+    following_count: int = 0
+
+
+class FollowUserSummary(BaseModel):
+    """Minimal user info shown in followers/following lists."""
+    user_id: str
+    name: str
+    handle: str
+    bio: Optional[str] = None
+    is_following: bool = False  # whether the requesting user follows this person
+
+
+class FollowListResponse(BaseModel):
+    users: List[FollowUserSummary] = Field(default_factory=list)
+    total: int = 0
+
+
+class FollowRequest(BaseModel):
+    """A pending follow request awaiting approval."""
+    id: str
+    from_user_id: str
+    name: str
+    handle: str
+    mutuals: int = 0
+    created_at: Optional[datetime] = None
+
+
+class FollowRequestsResponse(BaseModel):
+    requests: List[FollowRequest] = Field(default_factory=list)
+    total: int = 0
+
+
+class FollowCounts(BaseModel):
+    followers_count: int = 0
+    following_count: int = 0
+
+
+class UserSearchResult(BaseModel):
+    """A user returned from search."""
+    user_id: str
+    name: str
+    handle: str
+    bio: Optional[str] = None
+    is_following: bool = False
+
+
+class UserSearchResponse(BaseModel):
+    users: List[UserSearchResult] = Field(default_factory=list)
+    total: int = 0
