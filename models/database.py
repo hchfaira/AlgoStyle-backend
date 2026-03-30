@@ -30,6 +30,7 @@ class User(Base):
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     consulting_results = relationship("ImageConsultingResult", back_populates="user", cascade="all, delete-orphan")
     tokens = relationship("UserToken", back_populates="user", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="user", foreign_keys="Notification.user_id", cascade="all, delete-orphan")
 
     # Follow relationships
     followers = relationship(
@@ -293,3 +294,20 @@ class ImageConsultingResult(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     user = relationship("User", back_populates="consulting_results")
+
+
+class Notification(Base):
+    """In-app notification — follows, likes, etc."""
+    __tablename__ = "notifications"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    type = Column(String, nullable=False)  # new_follower, follow_request, outfit_liked
+    actor_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    outfit_id = Column(String, nullable=True)
+    content = Column(Text, nullable=False)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="notifications", foreign_keys=[user_id])
+    actor = relationship("User", foreign_keys=[actor_id])

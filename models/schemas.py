@@ -610,3 +610,27 @@ class UserSearchResult(BaseModel):
 class UserSearchResponse(BaseModel):
     users: List[UserSearchResult] = Field(default_factory=list)
     total: int = 0
+
+
+# ─── Notification Models ─────────────────────────────────────
+
+class NotificationItem(BaseModel):
+    """Single notification entry."""
+    id: str
+    type: str          # new_follower, follow_request, outfit_liked
+    actor_id: Optional[str] = None
+    actor_name: Optional[str] = None
+    outfit_id: Optional[str] = None
+    content: str
+    is_read: bool = False
+    created_at: Optional[datetime] = None
+
+
+class NotificationListResponse(BaseModel):
+    notifications: List[NotificationItem] = Field(default_factory=list)
+    total: int = 0
+    unread_count: int = 0
+
+
+class UnreadCountResponse(BaseModel):
+    unread_count: int = 0

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 import os
 
 from config import settings
-from routes import auth, onboarding, wardrobe, recommendation, chat, tryon, outfit, explain, image_consulting, social
+from routes import auth, onboarding, wardrobe, recommendation, chat, tryon, outfit, explain, image_consulting, social, notification
 from db import init_db, test_connection
 
 
@@ -69,6 +69,7 @@ app.include_router(tryon.router, prefix="/api/v1/tryon", tags=["Try-On"])
 app.include_router(outfit.router)
 app.include_router(image_consulting.router, prefix="/api/v1/image-consulting", tags=["Image Consulting"])
 app.include_router(social.router)
+app.include_router(notification.router)
 
 
 @app.get("/health")

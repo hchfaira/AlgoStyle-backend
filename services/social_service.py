@@ -28,6 +28,7 @@ from models.schemas import (
 )
 from db import get_db_context
 from services import neo4j_service
+from services import notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,18 @@ def toggle_like(current_user_id: str, outfit_id: str) -> ToggleLikeResponse:
             liked = True
 
         db.commit()
+
+        if liked and outfit.user_id != current_user_id:
+            actor = db.query(UserDB).filter(UserDB.id == current_user_id).first()
+            actor_name = actor.name if actor else "Someone"
+            notification_service.create_notification(
+                user_id=outfit.user_id,
+                type="outfit_liked",
+                actor_id=current_user_id,
+                content=f"{actor_name} liked your outfit",
+                outfit_id=outfit_id,
+            )
+
         likes = db.query(func.count(OutfitLike.id)).filter(OutfitLike.outfit_id == outfit_id).scalar() or 0
         return ToggleLikeResponse(liked=liked, likes=likes)
 
@@ -286,6 +299,23 @@ def follow_user(current_user_id: str, target_user_id: str) -> FollowResponse:
 
         db.add(UserFollow(follower_id=current_user_id, following_id=target_user_id, status=status))
         db.commit()
+
+        follower = db.query(UserDB).filter(UserDB.id == current_user_id).first()
+        follower_name = follower.name if follower else "Someone"
+        if status == "accepted":
+            notification_service.create_notification(
+                user_id=target_user_id,
+                type="new_follower",
+                actor_id=current_user_id,
+                content=f"{follower_name} started following you",
+            )
+        else:
+            notification_service.create_notification(
+                user_id=target_user_id,
+                type="follow_request",
+                actor_id=current_user_id,
+                content=f"{follower_name} requested to follow you",
+            )
 
         followers_c, following_c = _follow_counts(db, target_user_id)
         return FollowResponse(status=status, followers_count=followers_c, following_count=following_c)
@@ -421,6 +451,13 @@ def accept_follow_request(user_id: str, request_id: str) -> FollowResponse:
 
         follow.status = "accepted"
         db.commit()
+
+        notification_service.create_notification(
+            user_id=follow.follower_id,
+            type="new_follower",
+            actor_id=user_id,
+            content="Your follow request was accepted",
+        )
 
         followers_c, following_c = _follow_counts(db, user_id)
         return FollowResponse(status="accepted", followers_count=followers_c, following_count=following_c)
