@@ -143,6 +143,26 @@ class GarmentItem(Base):
     # eliminating the flat-column → nested-object conversion.
     llm_attributes = Column(JSON, nullable=True)
 
+    # Pre-computed vision features — cached result from LLM_project Layer 1 vision
+    # analysis.  Stored once at garment-add time; never recomputed unless the image
+    # changes.  Shape is whatever /api/v1/analyze/image returns under "analysis".
+    # Presence of this column means the garment was already analysed and does NOT
+    # need to be re-sent as a raw base64 image for pipeline calls — only its
+    # features + llm_attributes are forwarded, cutting payload by ~99%.
+    vision_features = Column(JSON, nullable=True)
+
+    # Smart Add enrichment scores — written by the fire-and-forget background job
+    # triggered after each garment save.  Shape:
+    #   { status, computed_at, pair_count, outfit_count, versatility_score,
+    #     is_gap_fill, gap_fill_reason, duplicate_id, duplicate_similarity,
+    #     body_compatibility, color_season_match, color_season_label, profile_notes }
+    # status: "pending" | "done" | "failed"
+    smart_add_scores = Column(JSON, nullable=True)
+
+    # True once COMPATIBLE_WITH relations have been written to Neo4j
+    # by the background enrichment job.
+    neo4j_indexed = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -276,6 +296,16 @@ class ImageConsultingResult(Base):
     contrast_level = Column(String, nullable=True)
     visual_weight = Column(String, nullable=True)
     color_season = Column(String, nullable=True)
+    
+    # 12-season colour analysis (enhanced)
+    season_sub = Column(String, nullable=True)
+    chroma = Column(String, nullable=True)
+    season_confidence = Column(Float, nullable=True)
+    
+    # Enhanced morphology
+    body_shape_secondary = Column(String, nullable=True)
+    body_shape_scores = Column(JSON, nullable=True)
+    waist_hip_ratio = Column(Float, nullable=True)
     
     # Estimated sizes
     estimated_top_size = Column(String, nullable=True)

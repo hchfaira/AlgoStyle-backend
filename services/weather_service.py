@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # ── In-memory cache: city → (timestamp, payload) ─────────────
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 30 * 60  # 30 minutes
+_MAX_CACHE_SIZE = 50   # evict oldest entry when exceeded
 
 
 def _time_of_day() -> str:
@@ -109,6 +110,10 @@ async def fetch_weather(city: str = "auto") -> dict:
             "cached": False,
         }
         _CACHE[cache_key] = (now, payload)
+        # Evict oldest entry if cache exceeds max size
+        if len(_CACHE) > _MAX_CACHE_SIZE:
+            oldest_key = min(_CACHE, key=lambda k: _CACHE[k][0])
+            del _CACHE[oldest_key]
         logger.info(
             f"Weather fetched for '{city_name}': {temp_c}°C, {payload['condition']}"
         )

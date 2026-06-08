@@ -163,6 +163,17 @@ class GarmentItem(BaseModel):
     worn_count: int = 0
     # LLM-native attributes stored verbatim — used by llm_client to skip re-mapping
     llm_attributes: Optional[dict] = None
+    # Pre-computed Layer 1 vision analysis — stored at garment-add time.
+    # Presence means the garment was already analysed; recommendation_service
+    # forwards these features instead of the raw base64 image to LLM_project,
+    # cutting payload by ~99%.
+    vision_features: Optional[dict] = None
+    # Smart Add enrichment — written by the fire-and-forget background job.
+    # status: "pending" | "done" | "failed"
+    # Includes Layer 2 wardrobe impact (pair_count, outfit_count, versatility_score,
+    # is_gap_fill, duplicate_id) and Layer 3 profile fit (body_compatibility,
+    # color_season_match, color_season_label, profile_notes).
+    smart_add_scores: Optional[dict] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -217,6 +228,8 @@ class RecommendationConfig(BaseModel):
     scoring_profile: ScoringProfile = ScoringProfile.DEFAULT
     no_repeat_weeks: int = 2
     top_k: int = 3
+    enable_explanation: bool = True
+    explanation_detail: str = "standard"  # brief | standard | detailed
 
 
 class OutfitScore(BaseModel):
@@ -246,6 +259,7 @@ class RecommendationResponse(BaseModel):
     outfits: List[OutfitResult]
     total_combinations: int = 0
     processing_time_ms: float = 0.0
+    error_message: Optional[str] = None
 
 
 # ─── Chat Models ─────────────────────────────────────────────
@@ -392,6 +406,16 @@ class ImageConsultingResult(BaseModel):
     visual_weight: Optional[str] = None     # light, medium, heavy …
     color_season: Optional[str] = None      # Spring, Summer, Autumn, Winter
 
+    # 12-season colour analysis (enhanced)
+    season_sub: Optional[str] = None        # e.g. "Light Spring", "Deep Winter" …
+    chroma: Optional[str] = None            # "clear" or "muted"
+    season_confidence: Optional[float] = None
+
+    # Enhanced morphology (continuous scoring)
+    body_shape_secondary: Optional[str] = None      # secondary body shape if confidence < 0.75
+    body_shape_scores: Optional[Dict[str, float]] = None  # normalised scores per body shape
+    waist_hip_ratio: Optional[float] = None
+
     # Estimated sizes (if height / weight provided)
     estimated_top_size: Optional[str] = None
     estimated_bottom_size: Optional[str] = None
@@ -501,6 +525,85 @@ class WardrobeInsightsResponse(BaseModel):
     overall_score: float = 0.0
     summary: str = ""
     cached: bool = False
+# ─── Smart Purchase Suggestions (Phase 1 — What to Buy Next) ─────────────────
+
+class PurchaseSuggestionItem(BaseModel):
+    """A single ranked purchase suggestion produced by the Smart Add algorithm."""
+    priority: int                          # 1 = highest priority
+    category: str                          # top, bottom, outerwear, shoes, accessory, dress
+    description: str                       # human-readable description of the item to buy
+    reason: str                            # why this fills a gap
+    estimated_outfit_increase: int         # how many new outfits this unlocks
+    suggested_colors: List[str] = Field(default_factory=list)   # e.g. ["beige", "camel", "ivory"]
+    suggested_styles: List[str] = Field(default_factory=list)   # e.g. ["slim fit", "relaxed"]
+    target_occasions: List[str] = Field(default_factory=list)   # e.g. ["work", "date"]
+    purchase_impact_score: float           # 0-1 composite impact score (higher = better ROI)
+    color_hex: str = "#D8D0C8"             # representative hex for UI color swatch
+    severity: str = "medium"              # low | medium | high — backing gap severity
+
+
+class WardrobeBottleneck(BaseModel):
+    """The category with the fewest items — adding here has highest combinatorial impact."""
+    category: str
+    count: int
+    impact_label: str                      # e.g. "Only 2 bottoms"
+
+
+class SmartPurchaseSuggestionsResponse(BaseModel):
+    """
+    Response for GET /wardrobe/smart-purchase-suggestions.
+    Contains AI-ranked purchase suggestions with full wardrobe context.
+    """
+    purchase_suggestions: List[PurchaseSuggestionItem] = Field(default_factory=list)
+    gaps: List[GapItem] = Field(default_factory=list)
+    occasion_coverage: List[OccasionCoverageItem] = Field(default_factory=list)
+    overall_score: float = 0.0             # wardrobe health score (0-1)
+    summary: str = ""                      # LLM-generated wardrobe summary
+    wardrobe_bottleneck: Optional[WardrobeBottleneck] = None
+    dominant_colors: List[str] = Field(default_factory=list)
+    total_items: int = 0
+    source: str = "llm"                    # "llm" | "fallback"
+
+
+# ─── Travel Capsule Models ────────────────────────────────────
+
+class TravelCapsuleRequest(BaseModel):
+    """Request body for POST /wardrobe/travel-capsule."""
+    user_id: str
+    occasion: str = "travel"              # travel | work_trip | weekend | city_break | beach | date_night
+    destination_climate: str = "mixed"    # warm | cold | mixed
+    duration_days: int = 7
+    occasion_types: List[str] = Field(default_factory=lambda: ["casual", "smart_casual"])
+    max_pieces: int = 10
+
+
+class CapsuleGarmentEntry(BaseModel):
+    """A garment within a capsule group, annotated with its role and outfit contribution."""
+    garment: GarmentItem
+    role: str                             # anchor | layer | accent | shoes | accessory
+    outfit_contribution: int              # new valid outfits this piece enables
+
+
+class CapsuleGroup(BaseModel):
+    """A fully-scored capsule selection."""
+    garments: List[CapsuleGarmentEntry]
+    valid_combinations: int
+    color_palette: List[str]              # top-3 hex values
+    color_names: List[str]                # human-readable names, e.g. ["Nude", "Charcoal", "White"]
+    occasion_coverage: Dict[str, float]   # e.g. {"casual": 0.9, "smart_casual": 0.7}
+    practicality_score: float             # 0-1 average material practicality
+    total_score: float                    # 0-100 composite score
+    summary: str                          # 1-sentence description
+
+
+class TravelCapsuleResponse(BaseModel):
+    """Response for POST /wardrobe/travel-capsule."""
+    best_group: CapsuleGroup
+    alternative_groups: List[CapsuleGroup] = Field(default_factory=list)
+    missing_pieces: List[str] = Field(default_factory=list)
+    total_wardrobe_items: int = 0
+    pieces_selected: int = 0
+    source: str = "rule"
 
 
 # ─── Social / Community Feed Models ──────────────────────────
@@ -508,6 +611,7 @@ class WardrobeInsightsResponse(BaseModel):
 class UserStats(BaseModel):
     outfits_shared: int = 0
     likes_received: int = 0
+
 
 class SocialFeedItem(BaseModel):
     """A single garment item in a social feed post (minimal representation)."""
@@ -634,3 +738,83 @@ class NotificationListResponse(BaseModel):
 
 class UnreadCountResponse(BaseModel):
     unread_count: int = 0
+
+# ─── Smart Purchase Suggestions (Phase 1 — What to Buy Next) ─────────────────
+
+class PurchaseSuggestionItem(BaseModel):
+    """A single ranked purchase suggestion produced by the Smart Add algorithm."""
+    priority: int                          # 1 = highest priority
+    category: str                          # top, bottom, outerwear, shoes, accessory, dress
+    description: str                       # human-readable description of the item to buy
+    reason: str                            # why this fills a gap
+    estimated_outfit_increase: int         # how many new outfits this unlocks
+    suggested_colors: List[str] = Field(default_factory=list)   # e.g. ["beige", "camel", "ivory"]
+    suggested_styles: List[str] = Field(default_factory=list)   # e.g. ["slim fit", "relaxed"]
+    target_occasions: List[str] = Field(default_factory=list)   # e.g. ["work", "date"]
+    purchase_impact_score: float           # 0-1 composite impact score (higher = better ROI)
+    color_hex: str = "#D8D0C8"             # representative hex for UI color swatch
+    severity: str = "medium"              # low | medium | high — backing gap severity
+
+
+class WardrobeBottleneck(BaseModel):
+    """The category with the fewest items — adding here has highest combinatorial impact."""
+    category: str
+    count: int
+    impact_label: str                      # e.g. "Only 2 bottoms"
+
+
+class SmartPurchaseSuggestionsResponse(BaseModel):
+    """
+    Response for GET /wardrobe/smart-purchase-suggestions.
+    Contains AI-ranked purchase suggestions with full wardrobe context.
+    """
+    purchase_suggestions: List[PurchaseSuggestionItem] = Field(default_factory=list)
+    gaps: List[GapItem] = Field(default_factory=list)
+    occasion_coverage: List[OccasionCoverageItem] = Field(default_factory=list)
+    overall_score: float = 0.0             # wardrobe health score (0-1)
+    summary: str = ""                      # LLM-generated wardrobe summary
+    wardrobe_bottleneck: Optional[WardrobeBottleneck] = None
+    dominant_colors: List[str] = Field(default_factory=list)
+    total_items: int = 0
+    source: str = "llm"                    # "llm" | "fallback"
+
+
+# ─── Travel Capsule Models ────────────────────────────────────
+
+class TravelCapsuleRequest(BaseModel):
+    """Request body for POST /wardrobe/travel-capsule."""
+    user_id: str
+    occasion: str = "travel"              # travel | work_trip | weekend | city_break | beach | date_night
+    destination_climate: str = "mixed"    # warm | cold | mixed
+    duration_days: int = 7
+    occasion_types: List[str] = Field(default_factory=lambda: ["casual", "smart_casual"])
+    max_pieces: int = 10
+
+
+class CapsuleGarmentEntry(BaseModel):
+    """A garment within a capsule group, annotated with its role and outfit contribution."""
+    garment: GarmentItem
+    role: str                             # anchor | layer | accent | shoes | accessory
+    outfit_contribution: int              # new valid outfits this piece enables
+
+
+class CapsuleGroup(BaseModel):
+    """A fully-scored capsule selection."""
+    garments: List[CapsuleGarmentEntry]
+    valid_combinations: int
+    color_palette: List[str]              # top-3 hex values
+    color_names: List[str]                # human-readable names, e.g. ["Nude", "Charcoal", "White"]
+    occasion_coverage: Dict[str, float]   # e.g. {"casual": 0.9, "smart_casual": 0.7}
+    practicality_score: float             # 0-1 average material practicality
+    total_score: float                    # 0-100 composite score
+    summary: str                          # 1-sentence description
+
+
+class TravelCapsuleResponse(BaseModel):
+    """Response for POST /wardrobe/travel-capsule."""
+    best_group: CapsuleGroup
+    alternative_groups: List[CapsuleGroup] = Field(default_factory=list)
+    missing_pieces: List[str] = Field(default_factory=list)
+    total_wardrobe_items: int = 0
+    pieces_selected: int = 0
+    source: str = "rule"

@@ -12,11 +12,16 @@ import json
 import random
 import base64
 import logging
+import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 logger = logging.getLogger(__name__)
+
+# Thread pool for smart-add background enrichment jobs — caps concurrent threads
+_ENRICHMENT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="smart_add")
 
 from fastapi import HTTPException
 from models.schemas import (
@@ -24,6 +29,7 @@ from models.schemas import (
     GarmentExtractionResult, ExtractionWarning,
     WardrobeInsightsResponse, GapItem, OccasionCoverageItem,
     VersatilityItem, DuplicateGroup, CostPerWearItem,
+    PurchaseSuggestionItem, WardrobeBottleneck, SmartPurchaseSuggestionsResponse,
 )
 from models.database import GarmentItem as GarmentItemDB, WardrobeAnalysisCache as WACacheDB, CustomOutfit as CustomOutfitDB
 from db import get_db_context
@@ -407,8 +413,213 @@ def garment_db_to_schema(g: GarmentItemDB) -> GarmentItem:
         purchase_price=getattr(g, "purchase_price", None),
         worn_count=getattr(g, "worn_count", 0) or 0,
         llm_attributes=getattr(g, "llm_attributes", None),
+        vision_features=getattr(g, "vision_features", None),
+        smart_add_scores=getattr(g, "smart_add_scores", None),
         created_at=g.created_at,
     )
+
+
+# ─── Smart Add — Fire-and-forget enrichment job ─────────────────────────────
+# After a garment is saved to PostgreSQL the HTTP response is returned
+# immediately.  This background coroutine then runs in a separate thread:
+#   1. Writes smart_add_scores.status = "pending" to DB
+#   2. Calls LLM_project Layer 2 (simulate-addition) with the new garment
+#      and the user's existing wardrobe → gets pair_count, outfit_count,
+#      versatility_score, is_gap_fill, duplicate_id
+#   3. Calls Layer 3 (morphology/advice) with the user's body profile →
+#      gets body_compatibility, color_season_match, profile_notes
+#   4. Creates COMPATIBLE_WITH relations in Neo4j for the top-20 pairs
+#   5. Writes all results into smart_add_scores and neo4j_indexed=True
+
+def _run_async_in_thread(coro) -> None:
+    """Submit an async coroutine to the enrichment thread pool."""
+    def _target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(coro)
+        except Exception as exc:
+            logger.warning("Smart-add enrichment thread error: %s", exc)
+        finally:
+            loop.close()
+
+    _ENRICHMENT_POOL.submit(_target)
+
+
+def _schedule_smart_add_enrichment(
+    garment_id: str,
+    user_id: str,
+    garment_dict: dict,
+) -> None:
+    """
+    Schedule the async enrichment job in a background daemon thread.
+    Returns immediately — never blocks the HTTP request.
+    """
+    _run_async_in_thread(
+        _enrich_garment_smart_add(garment_id, user_id, garment_dict)
+    )
+
+
+async def _enrich_garment_smart_add(
+    garment_id: str,
+    user_id: str,
+    garment_dict: dict,
+) -> None:
+    """
+    Background coroutine — runs after garment is saved.
+
+    Steps:
+      1. Mark smart_add_scores.status = "pending" in DB
+      2. Load existing wardrobe + user profile from DB
+      3. Call Layer 2 simulate-addition
+      4. Call Layer 3 morphology/advice
+      5. Build COMPATIBLE_WITH list for top-20 pairs
+      6. Write results to smart_add_scores + neo4j_indexed in DB
+      7. Create Neo4j COMPATIBLE_WITH relations
+    """
+    logger.info("Smart-add enrichment started for garment %s (user=%s)", garment_id, user_id)
+
+    # ── Step 1 — mark pending ────────────────────────────────────────────────
+    _write_smart_add_scores(garment_id, {"status": "pending", "computed_at": None})
+
+    try:
+        # ── Step 2 — load wardrobe + profile ────────────────────────────────
+        existing_wardrobe = _load_wardrobe_for_enrichment(user_id, exclude_id=garment_id)
+        user_profile      = _load_user_profile(user_id)
+
+        # ── Step 3 — Layer 2: simulate addition ──────────────────────────────
+        layer2: dict = {}
+        if existing_wardrobe:  # skip if first garment — nothing to compare against
+            layer2 = await _llm.simulate_garment_addition_async(
+                new_garment_dict=garment_dict,
+                wardrobe_dicts=existing_wardrobe,
+            )
+
+        # ── Step 4 — Layer 3: profile fit ────────────────────────────────────
+        layer3: dict = {}
+        if user_profile:
+            layer3 = await _llm.get_profile_fit_async(
+                garment_dict=garment_dict,
+                user_profile=user_profile,
+            )
+
+        # ── Step 5 — Build compatible_ids for Neo4j ──────────────────────────
+        # Layer 2 may return a list of { id, score } under various keys
+        raw_compat = (
+            layer2.get("compatible_garments")
+            or layer2.get("top_pairs")
+            or []
+        )
+        compatible_ids: list[tuple[str, float]] = []
+        for item in raw_compat[:20]:  # cap at 20 relations
+            if isinstance(item, dict):
+                cid = item.get("id") or item.get("garment_id")
+                score = float(item.get("score") or item.get("compatibility_score") or 0.5)
+                if cid:
+                    compatible_ids.append((cid, score))
+
+        # ── Step 6 — Write scores to PostgreSQL ──────────────────────────────
+        scores: dict = {
+            "status":       "done",
+            "computed_at":  datetime.now(timezone.utc).isoformat(),
+            # Layer 2 wardrobe impact
+            "pair_count":             layer2.get("pair_count") or len(compatible_ids),
+            "outfit_count":           layer2.get("outfit_count") or layer2.get("new_outfit_count") or 0,
+            "versatility_score":      layer2.get("versatility_score") or 0.0,
+            "is_gap_fill":            bool(layer2.get("is_gap_fill") or layer2.get("fills_gap")),
+            "gap_fill_reason":        layer2.get("gap_fill_reason") or layer2.get("recommendation") or "",
+            "duplicate_id":           layer2.get("duplicate_id"),
+            "duplicate_similarity":   layer2.get("duplicate_similarity"),
+            # Layer 3 profile fit
+            "body_compatibility":     layer3.get("body_compatibility") or 0.0,
+            "color_season_match":     bool(layer3.get("color_season_match")),
+            "color_season_label":     layer3.get("color_season_label") or "",
+            "profile_notes":          layer3.get("profile_notes") or "",
+        }
+        _write_smart_add_scores(garment_id, scores, neo4j_indexed=bool(compatible_ids))
+
+        # ── Step 7 — Neo4j COMPATIBLE_WITH relations ──────────────────────────
+        if compatible_ids:
+            neo4j_service.create_compatibility_relations(garment_id, compatible_ids)
+
+        logger.info(
+            "Smart-add enrichment done for %s: pairs=%d outfits=%d gap_fill=%s",
+            garment_id, scores["pair_count"], scores["outfit_count"], scores["is_gap_fill"],
+        )
+
+    except Exception as exc:
+        logger.warning("Smart-add enrichment failed for %s: %s", garment_id, exc)
+        _write_smart_add_scores(garment_id, {
+            "status": "failed",
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+        })
+
+
+def _write_smart_add_scores(
+    garment_id: str,
+    scores: dict,
+    neo4j_indexed: bool = False,
+) -> None:
+    """Persist smart_add_scores (and optionally neo4j_indexed) to the DB row."""
+    try:
+        with get_db_context() as db:
+            row = db.query(GarmentItemDB).filter(GarmentItemDB.id == garment_id).first()
+            if row:
+                row.smart_add_scores = scores
+                if neo4j_indexed:
+                    row.neo4j_indexed = True
+                db.commit()
+    except Exception as exc:
+        logger.warning("_write_smart_add_scores failed for %s: %s", garment_id, exc)
+
+
+def _load_wardrobe_for_enrichment(user_id: str, exclude_id: str) -> list[dict]:
+    """
+    Load all garments for user as plain dicts (without the new garment itself).
+    Returns an empty list on any DB error.
+    """
+    try:
+        with get_db_context() as db:
+            rows = (
+                db.query(GarmentItemDB)
+                .filter(
+                    GarmentItemDB.user_id == user_id,
+                    GarmentItemDB.id != exclude_id,
+                )
+                .all()
+            )
+            return [garment_db_to_schema(r).dict() for r in rows]
+    except Exception as exc:
+        logger.warning("_load_wardrobe_for_enrichment failed: %s", exc)
+        return []
+
+
+def _load_user_profile(user_id: str) -> dict:
+    """
+    Load the user's profile from UserProfile DB table.
+    Returns an empty dict if not found or on error.
+    """
+    try:
+        from models.database import UserProfile as UserProfileDB
+        with get_db_context() as db:
+            row = db.query(UserProfileDB).filter(UserProfileDB.user_id == user_id).first()
+            if not row:
+                return {}
+            return {
+                "body_shape":   row.body_shape,
+                "skin_tone":    row.skin_tone,
+                "undertone":    row.undertone,
+                "color_season": getattr(row, "color_season", None),
+                "height_cm":    row.height_cm,
+                "weight_kg":    row.weight_kg,
+            }
+    except Exception as exc:
+        logger.warning("_load_user_profile failed for user=%s: %s", user_id, exc)
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def add_garment(
@@ -426,6 +637,11 @@ def add_garment(
     llm_attributes: the LLM-native nested dict from GarmentExtractionResult.
     When provided it is stored verbatim so that _algogarment_to_llm() can
     return it directly on every future API call — no flat→nested conversion needed.
+
+    vision_features: if image_bytes are present AND LLM_project is reachable,
+    the garment image is analysed once at save time and the result stored in
+    vision_features.  Future pipeline calls forward these pre-computed features
+    instead of the raw base64 image, reducing per-request payload by ~99%.
     """
     with get_db_context() as db:
         # Use confirmed extraction attrs when available
@@ -443,6 +659,21 @@ def add_garment(
             }
         else:
             attrs = mock_analyze_garment(category)
+
+        # ── Cache vision analysis at save time ──────────────────────────────
+        # Try to call LLM_project Layer 1 vision analysis once here so the
+        # result is stored in vision_features and never recomputed again.
+        # If the call fails (LLM_project offline) we silently skip — the
+        # recommendation_service will fall back to the raw image instead.
+        vision_features: Optional[dict] = None
+        if image_bytes and not vision_features:
+            try:
+                llm_analysis = _llm.analyze_garment_image(image_bytes)
+                if llm_analysis and llm_analysis.get("analysis"):
+                    vision_features = llm_analysis["analysis"]
+                    logger.info("Cached vision_features for new garment (user=%s)", user_id)
+            except Exception as vf_exc:
+                logger.debug("Vision pre-analysis skipped (LLM unavailable): %s", vf_exc)
 
         garment = GarmentItemDB(
             user_id=user_id,
@@ -462,17 +693,28 @@ def add_garment(
             confidence=attrs.get("confidence", 0.85),
             purchase_price=extra_attrs.get("purchase_price") if extra_attrs else None,
             llm_attributes=llm_attributes,
+            vision_features=vision_features,
         )
         db.add(garment)
         db.commit()
         db.refresh(garment)
-        # ── Sync to Neo4j (fire-and-forget) ──────────────
+        # ── Sync to Neo4j node (fire-and-forget, synchronous) ─────────────
         neo4j_service.upsert_garment(
             garment_id=garment.id,
             user_id=user_id,
             attrs={**attrs, "image_url": garment.image_url or ""},
         )
-        return garment_db_to_schema(garment)
+        result = garment_db_to_schema(garment)
+
+    # ── Fire-and-forget: Layer 2 + Layer 3 enrichment ─────────────────────
+    # Kick off the async enrichment job in a background thread so the HTTP
+    # response is returned immediately (no waiting).
+    _schedule_smart_add_enrichment(
+        garment_id=result.id,
+        user_id=user_id,
+        garment_dict=result.dict(),
+    )
+    return result
 
 
 def list_garments(
@@ -606,6 +848,37 @@ def toggle_for_sale(user_id: str, garment_id: str) -> dict:
         return {"id": garment_id, "for_sale": garment.for_sale}
 
 
+def mark_garment_worn(user_id: str, garment_id: str) -> dict:
+    """
+    Increment times_worn (+ worn_count if column exists) and set last_worn = now.
+    Returns updated counts so the mobile client can optimistically update UI.
+    """
+    from datetime import datetime, timezone
+    with get_db_context() as db:
+        garment = db.query(GarmentItemDB).filter(
+            GarmentItemDB.id == garment_id,
+            GarmentItemDB.user_id == user_id
+        ).first()
+        if not garment:
+            raise HTTPException(404, "Garment not found")
+
+        # Increment both legacy and new columns
+        garment.times_worn = (garment.times_worn or 0) + 1
+        garment.last_worn  = datetime.now(timezone.utc)
+
+        # worn_count added by migration — guard for older DBs
+        if hasattr(garment, "worn_count"):
+            garment.worn_count = (garment.worn_count or 0) + 1
+
+        db.commit()
+        return {
+            "id":          garment_id,
+            "times_worn":  garment.times_worn,
+            "worn_count":  getattr(garment, "worn_count", garment.times_worn),
+            "last_worn":   garment.last_worn.isoformat(),
+        }
+
+
 def get_wardrobe_stats(user_id: str) -> dict:
     """Get wardrobe statistics."""
     with get_db_context() as db:
@@ -623,35 +896,272 @@ def get_wardrobe_stats(user_id: str) -> dict:
         }
 
 
-# ── Smart Suggestions ─────────────────────────────────────────
+# ── Smart Purchase Suggestions (Phase 1 — "What to Buy Next") ────────────────
 
-def get_smart_suggestions(user_id: str) -> dict:
-    """AI-powered purchase suggestions that maximise outfit combinations."""
+# ── Fallback catalogue: used when LLM_project is unavailable ──────────────────
+_NEUTRAL_KEYWORDS = {"white", "black", "grey", "gray", "beige", "navy", "tan", "cream", "nude", "ivory", "camel"}
+
+_CAT_HEX: dict[str, str] = {
+    "top":       "#F8F6F0",
+    "bottom":    "#1A1A1A",
+    "outerwear": "#1B2A4A",
+    "shoes":     "#C19A6B",
+    "accessory": "#C19A6B",
+    "dress":     "#EDE8E2",
+}
+
+# Fallback suggestions: one per category ordered by universal impact
+_FALLBACK_SUGGESTIONS: list[dict] = [
+    {
+        "priority": 1, "category": "accessory", "description": "Tan leather belt",
+        "reason": "A warm-toned belt bridges your existing tops and bottoms",
+        "estimated_outfit_increase": 10,
+        "suggested_colors": ["tan", "camel"], "suggested_styles": ["medium width"],
+        "target_occasions": ["work", "smart_casual"],
+        "purchase_impact_score": 0.88, "color_hex": "#C19A6B", "severity": "high",
+    },
+    {
+        "priority": 2, "category": "top", "description": "White linen shirt — relaxed fit",
+        "reason": "White is your most-missing neutral; pairs with every bottom you own",
+        "estimated_outfit_increase": 12,
+        "suggested_colors": ["white", "ivory"], "suggested_styles": ["relaxed fit", "linen"],
+        "target_occasions": ["daily_wear", "date"],
+        "purchase_impact_score": 0.84, "color_hex": "#F8F6F0", "severity": "high",
+    },
+    {
+        "priority": 3, "category": "shoes", "description": "Clean white leather sneakers",
+        "reason": "White sneakers are the most versatile shoe — works with 80% of outfits",
+        "estimated_outfit_increase": 15,
+        "suggested_colors": ["white"], "suggested_styles": ["minimalist", "leather"],
+        "target_occasions": ["daily_wear", "casual"],
+        "purchase_impact_score": 0.82, "color_hex": "#F5F5F5", "severity": "medium",
+    },
+    {
+        "priority": 4, "category": "bottom", "description": "Beige straight-leg trousers",
+        "reason": "A neutral bottom balances top-heavy wardrobes and enables smart-casual outfits",
+        "estimated_outfit_increase": 9,
+        "suggested_colors": ["beige", "cream"], "suggested_styles": ["straight-leg", "tailored"],
+        "target_occasions": ["work", "date"],
+        "purchase_impact_score": 0.78, "color_hex": "#D4C5A9", "severity": "medium",
+    },
+    {
+        "priority": 5, "category": "outerwear", "description": "Navy structured blazer",
+        "reason": "Elevates every smart-casual combination; fills a formality gap",
+        "estimated_outfit_increase": 12,
+        "suggested_colors": ["navy", "charcoal"], "suggested_styles": ["structured", "tailored"],
+        "target_occasions": ["work", "cocktail"],
+        "purchase_impact_score": 0.75, "color_hex": "#1B2A4A", "severity": "medium",
+    },
+    {
+        "priority": 6, "category": "dress", "description": "Midi slip dress in neutral tone",
+        "reason": "A versatile midi dress covers evening and casual occasions in one piece",
+        "estimated_outfit_increase": 7,
+        "suggested_colors": ["nude", "black", "ivory"], "suggested_styles": ["slip", "midi"],
+        "target_occasions": ["date", "cocktail"],
+        "purchase_impact_score": 0.68, "color_hex": "#EDE8E2", "severity": "low",
+    },
+]
+
+
+def _build_fallback_suggestions(
+    items: list,
+    max_suggestions: int = 6,
+) -> SmartPurchaseSuggestionsResponse:
+    """
+    Rule-based fallback when LLM_project is unreachable.
+    Scores suggestions by combinatorial bottleneck + occasion gap analysis.
+    """
+    cat_counts: dict[str, int] = {}
+    formality_counts: dict[str, int] = {}
+    color_tally: dict[str, int] = {}
+    total = len(items)
+
+    for g in items:
+        cat_counts[g.category] = cat_counts.get(g.category, 0) + 1
+        formality_counts[g.formality] = formality_counts.get(g.formality, 0) + 1
+        col = (g.color_primary or "").lower().strip()
+        if col:
+            color_tally[col] = color_tally.get(col, 0) + 1
+
+    # Identify bottleneck
+    bottleneck_cat: Optional[str] = min(cat_counts, key=lambda c: cat_counts[c]) if cat_counts else None
+    bottleneck_count: int = cat_counts.get(bottleneck_cat, 0) if bottleneck_cat else 0
+
+    # Check formality gap (< 10% formal/business items)
+    formal_count = formality_counts.get("formal", 0) + formality_counts.get("business", 0)
+    has_formality_gap = total > 5 and formal_count < max(total * 0.10, 2)
+
+    # Check neutral color gap
+    neutral_count = sum(v for k, v in color_tally.items() if any(n in k for n in _NEUTRAL_KEYWORDS))
+    has_neutral_gap = total > 3 and neutral_count < total * 0.30
+
+    dominant_colors = sorted(color_tally, key=lambda c: -color_tally[c])[:4]
+
+    # Re-score fallback suggestions based on actual wardrobe state
+    scored: list[dict] = []
+    for sug in _FALLBACK_SUGGESTIONS:
+        cat = sug["category"]
+        score = sug["purchase_impact_score"]
+        if cat == bottleneck_cat:
+            score = min(score + 0.12, 1.0)
+        if has_formality_gap and cat in ("outerwear", "shoes", "bottom"):
+            score = min(score + 0.06, 1.0)
+        if has_neutral_gap and any(c in _NEUTRAL_KEYWORDS for c in sug["suggested_colors"]):
+            score = min(score + 0.05, 1.0)
+        # Penalise categories already well-stocked (>5 items)
+        if cat_counts.get(cat, 0) > 5:
+            score = max(score - 0.10, 0.1)
+        scored.append({**sug, "purchase_impact_score": round(score, 3)})
+
+    scored.sort(key=lambda x: -x["purchase_impact_score"])
+
+    suggestions = [PurchaseSuggestionItem(**s) for s in scored[:max_suggestions]]
+
+    # Simple insight from rule-based analysis
+    tops = cat_counts.get("top", 0)
+    bottoms = cat_counts.get("bottom", 0)
+    if tops > 4 and bottoms < 3:
+        summary = f"You have {tops} tops but only {bottoms} bottoms — adding bottoms has the highest outfit impact."
+    elif has_formality_gap:
+        summary = "Your wardrobe lacks formal pieces — adding one outerwear or shoes item significantly expands occasion coverage."
+    elif has_neutral_gap:
+        summary = "Your palette is vibrant but missing neutral anchors — a beige or white piece would unlock many new combinations."
+    elif total == 0:
+        summary = "Add some items to your wardrobe to unlock personalised suggestions."
+    else:
+        summary = "Your wardrobe is growing well. Focus on filling the category with the fewest items for maximum outfit variety."
+
+    bottleneck = WardrobeBottleneck(
+        category=bottleneck_cat or "",
+        count=bottleneck_count,
+        impact_label=f"Only {bottleneck_count} {bottleneck_cat}(s)" if bottleneck_cat else "",
+    ) if bottleneck_cat else None
+
+    return SmartPurchaseSuggestionsResponse(
+        purchase_suggestions=suggestions,
+        gaps=[],
+        occasion_coverage=[],
+        overall_score=0.0,
+        summary=summary,
+        wardrobe_bottleneck=bottleneck,
+        dominant_colors=dominant_colors,
+        total_items=total,
+        source="fallback",
+    )
+
+
+def get_smart_purchase_suggestions(
+    user_id: str,
+    max_suggestions: int = 6,
+) -> SmartPurchaseSuggestionsResponse:
+    """
+    AI-powered "What to Buy Next" — Phase 1.
+
+    Algorithm (in order of priority):
+    1. Call LLM_project /wardrobe-analysis/analyze to get:
+       - purchase_suggestions (ranked by wardrobe impact)
+       - gap_analysis (category_missing, formality_gap, etc.)
+       - occasion_coverage (which occasions are under-covered)
+    2. Enrich each suggestion with a composite purchase_impact_score:
+       purchase_impact_score = 0.40 * outfit_unlock_norm
+                             + 0.25 * gap_severity_weight
+                             + 0.20 * occasion_gap_weight
+                             + 0.15 * bottleneck_bonus
+    3. Filter out duplicates of existing items (similarity > 0.80)
+    4. Return top-N sorted by purchase_impact_score descending
+
+    Falls back to rule-based suggestions when LLM_project is unavailable.
+    """
     with get_db_context() as db:
         items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
-        existing_cats = [g.category for g in items]
 
-        suggestions = sorted(
-            SMART_SUGGESTIONS,
-            key=lambda s: (s["category"] not in existing_cats, s["new_combinations"]),
-            reverse=True,
-        )
+    total = len(items)
+    garment_dicts = [garment_db_to_schema(g).model_dump() for g in items]
 
-        cat_counts: dict[str, int] = {}
-        for g in items:
-            c = g.category
-            cat_counts[c] = cat_counts.get(c, 0) + 1
+    # ── Try LLM_project ──────────────────────────────────────────────────────
+    if total > 0 and _llm.is_available():
+        try:
+            result = _llm.get_purchase_suggestions(
+                garments_dicts=garment_dicts,
+                max_suggestions=max_suggestions,
+            )
+            if result and result.get("purchase_suggestions"):
+                raw_sugs = result["purchase_suggestions"]
+                raw_gaps = result.get("gaps") or []
+                raw_cov  = result.get("occasion_coverage") or []
+                bottleneck_raw = result.get("wardrobe_bottleneck") or {}
 
-        tops = cat_counts.get("top", 0)
-        bottoms = cat_counts.get("bottom", 0)
-        if tops > 4 and bottoms < 3:
-            insight = f"You have {tops} tops but only {bottoms} bottoms — adding bottoms has the highest impact."
-        elif len(items) == 0:
-            insight = "Add some items to your wardrobe to unlock personalised suggestions."
-        else:
-            insight = "Adding a warm-toned accessory would unlock 5+ new outfit combinations."
+                # ── Deduplicate: skip suggestions for categories already saturated ──
+                # A category is "saturated" if the user has > 8 items and no occasion gap
+                low_coverage_cats: set[str] = set()
+                for cov in raw_cov:
+                    if isinstance(cov.get("coverage_score"), (int, float)) and cov["coverage_score"] < 0.5:
+                        for mc in (cov.get("missing_categories") or []):
+                            low_coverage_cats.add(mc.lower())
 
-        return {"suggestions": suggestions, "insight": insight}
+                cat_counts: dict[str, int] = {}
+                for g in items:
+                    cat_counts[g.category] = cat_counts.get(g.category, 0) + 1
+
+                filtered_sugs: list[PurchaseSuggestionItem] = []
+                for s in raw_sugs[:max_suggestions * 2]:  # over-fetch then filter
+                    cat = s.get("category", "")
+                    is_saturated = cat_counts.get(cat, 0) > 8 and cat not in low_coverage_cats
+                    if not is_saturated:
+                        filtered_sugs.append(PurchaseSuggestionItem(**s))
+                    if len(filtered_sugs) >= max_suggestions:
+                        break
+
+                # If filtering removed too many, backfill from fallback
+                if len(filtered_sugs) < 3:
+                    fallback = _build_fallback_suggestions(items, max_suggestions)
+                    seen_cats = {s.category for s in filtered_sugs}
+                    for fb_sug in fallback.purchase_suggestions:
+                        if fb_sug.category not in seen_cats:
+                            filtered_sugs.append(fb_sug)
+                        if len(filtered_sugs) >= max_suggestions:
+                            break
+
+                gaps = [GapItem(**g) if isinstance(g, dict) else g for g in raw_gaps]
+                occasion_coverage = [
+                    OccasionCoverageItem(**c) if isinstance(c, dict) else c
+                    for c in raw_cov
+                ]
+
+                bottleneck = WardrobeBottleneck(
+                    category=bottleneck_raw.get("category", ""),
+                    count=int(bottleneck_raw.get("count", 0)),
+                    impact_label=bottleneck_raw.get("impact_label", ""),
+                ) if bottleneck_raw.get("category") else None
+
+                logger.info(
+                    "Smart purchase suggestions user=%s via LLM: %d suggestions",
+                    user_id, len(filtered_sugs),
+                )
+                return SmartPurchaseSuggestionsResponse(
+                    purchase_suggestions=filtered_sugs,
+                    gaps=gaps,
+                    occasion_coverage=occasion_coverage,
+                    overall_score=float(result.get("overall_score") or 0.0),
+                    summary=result.get("summary") or "",
+                    wardrobe_bottleneck=bottleneck,
+                    dominant_colors=result.get("dominant_colors") or [],
+                    total_items=total,
+                    source="llm",
+                )
+        except Exception as exc:
+            logger.warning("Smart purchase suggestions LLM path failed: %s", exc)
+
+    # ── Rule-based fallback ───────────────────────────────────────────────────
+    logger.info("Smart purchase suggestions user=%s via rule-based fallback", user_id)
+    return _build_fallback_suggestions(items, max_suggestions)
+
+
+# Keep old name as alias for backward compat (routes still call get_smart_suggestions)
+def get_smart_suggestions(user_id: str) -> dict:
+    """Legacy wrapper — returns the new SmartPurchaseSuggestionsResponse as a dict."""
+    result = get_smart_purchase_suggestions(user_id)
+    return result.model_dump()
 
 
 # ── Closet Audit ──────────────────────────────────────────────
@@ -757,23 +1267,32 @@ def get_capsule_score(user_id: str) -> dict:
     except Exception as exc:
         logger.warning("LLM wardrobe-analysis unavailable, falling back: %s", exc)
 
-    if llm_result and (llm_result.get("versatility_scores") or llm_result.get("occasion_coverage")):
-        versatility_scores: dict = llm_result.get("versatility_scores") or {}
-        gap_analysis: list = llm_result.get("gap_analysis") or []
-        occasion_coverage: dict = llm_result.get("occasion_coverage") or {}
+    if llm_result and llm_result.get("occasion_coverage"):
+        # occasion_coverage is a LIST of {occasion, coverage_score, ...}
+        raw_occ_list: list = llm_result.get("occasion_coverage") or []
+        raw_gaps: list = llm_result.get("gaps") or llm_result.get("gap_analysis") or []
         distribution: dict = llm_result.get("distribution") or {}
+        top_versatile: list = llm_result.get("top_versatile_items") or []
+        overall_score: float = float(llm_result.get("overall_score") or 0.0)
 
-        # Derive a 0–100 score from occasion coverage and versatility
-        occ_vals = [v for v in occasion_coverage.values() if isinstance(v, (int, float))]
-        occ_avg = sum(occ_vals) / len(occ_vals) if occ_vals else 0.5
+        # occasion coverage average from list of {occasion, coverage_score, ...}
+        occ_scores = [
+            float(item["coverage_score"])
+            for item in raw_occ_list
+            if isinstance(item, dict) and "coverage_score" in item
+        ]
+        occ_avg = sum(occ_scores) / len(occ_scores) if occ_scores else 0.5
 
-        vers_vals = [v for v in versatility_scores.values() if isinstance(v, (int, float))]
-        vers_avg = sum(vers_vals) / len(vers_vals) if vers_vals else 0.5
+        # versatility: use overall_score if no per-item scores available
+        vers_avg = overall_score if overall_score > 0 else 0.5
 
-        # Colour cohesion & season balance from distribution if available
+        # Colour cohesion from distribution
         colour_cohesion_raw = distribution.get("color_distribution", {})
         neutral_keywords = {"white", "black", "grey", "gray", "beige", "navy", "tan", "cream", "nude"}
-        neutral_count = sum(v for k, v in colour_cohesion_raw.items() if any(n in k.lower() for n in neutral_keywords)) if colour_cohesion_raw else 0
+        neutral_count = sum(
+            v for k, v in colour_cohesion_raw.items()
+            if any(n in k.lower() for n in neutral_keywords)
+        ) if colour_cohesion_raw else 0
         total = len(items)
         colour_cohesion = min(neutral_count / max(total, 1) + 0.3, 1.0)
 
@@ -786,9 +1305,13 @@ def get_capsule_score(user_id: str) -> dict:
 
         # Opportunities from gap analysis
         opps = []
-        for gap in (gap_analysis or [])[:3]:
+        for gap in (raw_gaps or [])[:3]:
             if isinstance(gap, dict):
-                opps.append({"type": gap.get("type", "category"), "label": gap.get("label") or gap.get("description", ""), "impact": gap.get("impact", "+5 pts")})
+                opps.append({
+                    "type": gap.get("gap_type") or gap.get("type", "category"),
+                    "label": gap.get("description") or gap.get("label", ""),
+                    "impact": "+5 pts",
+                })
             elif isinstance(gap, str):
                 opps.append({"type": "category", "label": gap, "impact": "+5 pts"})
 
@@ -950,7 +1473,12 @@ def get_garment_analysis(user_id: str, garment_id: str) -> dict:
         "accessory": ["top", "bottom", "dress", "outerwear"],
     }
     compatible_cats = cat_pairs.get(garment.category, [])
-    wardrobe_cats = set(g.category for g in wardrobe_dicts if g.get("id") != garment_id) if wardrobe_dicts else set()
+    # wardrobe_dicts is a list of plain dicts — use ["key"] not .attribute
+    wardrobe_cats = set(
+        g.get("attributes", {}).get("category", g.get("category", ""))
+        for g in wardrobe_dicts
+        if g.get("id") != garment_id
+    ) if wardrobe_dicts else set()
     matched = sum(1 for c in compatible_cats if c in wardrobe_cats)
     compatibility = matched / max(len(compatible_cats), 1)
     outfit_count = max(1, int(compatibility * total * versatility * 0.6))
@@ -1074,8 +1602,91 @@ REMOVAL_PROFILES = {
 }
 
 
+def _rule_removal_score(g: "GarmentItemDB", p: dict) -> tuple[int, list[str]]:
+    """
+    Compute a differentiated rule-based removal risk score (0–100) for a garment.
+    Uses worn frequency, recency, seasonality, confidence and formality breadth.
+    Returns (score, reasons_list).
+    """
+    score = 0
+    reasons: list[str] = []
+
+    # ── Wear frequency (0-40 pts) ─────────────────────────────────────────────
+    times = g.times_worn or 0
+    if times == 0:
+        score += 40
+        reasons.append("Never worn")
+    elif times <= p["low_use_threshold"]:
+        pts = max(5, 30 - times * 5)   # 1 worn → 25, 2 → 20, 3 → 15 …
+        score += pts
+        reasons.append(f"Worn only {times} time(s)")
+    # else: worn enough — no penalty
+
+    # ── Recency (0-20 pts) ────────────────────────────────────────────────────
+    last_worn = g.last_worn
+    if last_worn is None and times > 0:
+        # Has been worn but date lost — mild penalty
+        score += 8
+    elif last_worn is not None:
+        from datetime import date as date_cls
+        # Normalise: strip tzinfo if naive to avoid offset-naive/aware mismatch
+        now = datetime.now(timezone.utc)
+        if hasattr(last_worn, "tzinfo") and last_worn.tzinfo is None:
+            now = datetime.now()  # naive comparison
+        days_ago = (now - last_worn).days
+        if days_ago > 365:
+            score += 20
+            reasons.append(f"Not worn in {days_ago // 30} months")
+        elif days_ago > 180:
+            score += 12
+            reasons.append(f"Not worn in {days_ago // 30} months")
+        elif days_ago > 90:
+            score += 6
+
+    # ── Seasonality (0-20 pts) ────────────────────────────────────────────────
+    seasons = g.seasons or []
+    n_seasons = len(seasons)
+    if n_seasons == 0:
+        score += 15
+        reasons.append("No season assigned")
+    elif n_seasons == 1:
+        score += 10
+        reasons.append("Single-season item")
+    elif n_seasons == 2:
+        score += 4
+    # 3-4 seasons: no penalty (versatile)
+
+    # ── Confidence / quality (0-15 pts) ──────────────────────────────────────
+    conf = g.confidence or _CONFIDENCE_DEFAULT
+    if conf < 0.50:
+        score += 15
+        reasons.append("Poor style match")
+    elif conf < _CONFIDENCE_CAPSULE_MIN:
+        score += 8
+        reasons.append("Low style match")
+
+    # ── Formality gap bonus (0-5 pts) ────────────────────────────────────────
+    # If this is the only item of its formality level in the wardrobe it's
+    # actually hard to remove — but if formality is unrecognised, minor penalty
+    formality = (g.formality or "").lower()
+    if formality not in ("casual", "smart casual", "business", "formal", "sport", "lounge"):
+        score += 5
+
+    return min(score, 100), reasons
+
+
 def get_smart_removal(user_id: str, profile: str = "balanced") -> dict:
-    """Suggest garments to remove based on a declutter profile, using LLM smart-removal verdicts."""
+    """
+    Suggest garments to remove based on a declutter profile.
+
+    Strategy:
+    1. Compute a rule-based risk score for every garment (differentiated — not flat).
+    2. Keep the top-N rule candidates (≤12) as pre-filter.
+    3. Call LLM batch endpoint once for all pre-filtered candidates.
+       The batch call returns regret_risk_score per garment (real outfit-graph analysis).
+    4. Blend: final = 0.40 × rule + 0.60 × LLM (when LLM available).
+    5. Fall back to pure rule score if LLM is down.
+    """
     with get_db_context() as db:
         items = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
 
@@ -1091,71 +1702,112 @@ def get_smart_removal(user_id: str, profile: str = "balanced") -> dict:
                 "summary": "No garments found.",
             }
 
-        wardrobe_dicts = [garment_db_to_schema(g).model_dump() for g in items]
+        wardrobe_dicts = [garment_db_to_schema(g).model_dump(mode="json") for g in items]
 
-    # ── Pre-filter by rule-based risk score ───────────────────────────────────
-    rule_candidates = []
+    # ── Step 1: rule-based pre-scoring ───────────────────────────────────────
+    # Map frontend profile names → LLM user_goal enum values
+    _GOAL_MAP = {
+        "minimalist": "minimalist",
+        "balanced":   "maximize_options",
+        "generous":   "style_upgrade",
+    }
+    llm_user_goal = _GOAL_MAP.get(profile, "maximize_options")
+
+    scored: list[tuple] = []
     for g in items:
-        risk_score = 0
-        if g.times_worn == 0:
-            risk_score += 40
-        elif g.times_worn <= p["low_use_threshold"]:
-            risk_score += 20
-        if len(g.seasons or []) <= 1:
-            risk_score += 15
-        if g.confidence < _CONFIDENCE_CAPSULE_MIN:
-            risk_score += 10
-        if risk_score >= 20:
-            rule_candidates.append((g, risk_score))
+        rule_score, rule_reasons = _rule_removal_score(g, p)
+        scored.append((g, rule_score, rule_reasons))
 
-    rule_candidates.sort(key=lambda x: x[1], reverse=True)
-    # Only call LLM for top 10 rule-flagged items to keep latency reasonable
-    top_candidates = rule_candidates[:10]
+    # Sort and keep only candidates that are actually worth suggesting
+    scored.sort(key=lambda x: x[1], reverse=True)
+    min_threshold = 15   # don't suggest items with a risk score below this
+    candidates_pool = [(g, sc, rs) for g, sc, rs in scored if sc >= min_threshold][:12]
 
-    candidates = []
-    for g, base_risk in top_candidates:
-        cat = g.category
-        llm_verdict = {}
+    if not candidates_pool:
+        return {
+            "candidates": [],
+            "total_candidates": 0,
+            "profile": profile,
+            "current_count": len(items),
+            "target_count": p["max_items"],
+            "summary": "Your wardrobe looks well-curated — no clear removal candidates found.",
+        }
+
+    # ── Step 2: batch LLM call ────────────────────────────────────────────────
+    # Build a sub-wardrobe limited to the candidate garments for the LLM
+    candidate_ids = {g.id for g, _, _ in candidates_pool}
+    candidate_dicts = [d for d in wardrobe_dicts if d.get("id") in candidate_ids]
+
+    llm_verdicts: dict[str, dict] = {}   # garment_id → verdict dict
+    if _llm.is_available():
         try:
-            llm_verdict = _llm.smart_removal_verdict(
-                garment_id=g.id,
-                garments_dicts=wardrobe_dicts,
-                user_goal=profile,
+            raw_verdicts = _llm.smart_removal_wardrobe(
+                garments_dicts=candidate_dicts,
+                user_goal=llm_user_goal,
+            )
+            for v in (raw_verdicts or []):
+                gid = v.get("garment_id") or v.get("id")
+                if gid:
+                    llm_verdicts[gid] = v
+            logger.info(
+                "Smart-removal LLM batch: %d verdicts for user=%s",
+                len(llm_verdicts), user_id,
             )
         except Exception as exc:
-            logger.warning("LLM smart-removal unavailable for %s: %s", g.id, exc)
+            logger.warning("LLM smart_removal_wardrobe failed: %s", exc)
 
-        if llm_verdict and llm_verdict.get("verdict"):
-            verdict_label = llm_verdict.get("verdict", "")
-            regret_risk  = float(llm_verdict.get("regret_risk_score", base_risk / 100))
-            reasons      = llm_verdict.get("reasons") or []
-            outfit_count = int(llm_verdict.get("outfits_affected") or llm_verdict.get("outfit_count") or 0)
-            removal_impact = (
-                "safe" if outfit_count == 0
-                else "low" if outfit_count <= 2
-                else "medium" if outfit_count <= 5
-                else "high"
+    # ── Step 3: merge rule + LLM scores ──────────────────────────────────────
+    candidates = []
+    for g, rule_score, rule_reasons in candidates_pool:
+        cat = g.category
+        v = llm_verdicts.get(g.id, {})
+
+        if v and v.get("verdict"):
+            regret_raw = v.get("regret_risk_score", rule_score / 100)
+            regret_raw = float(regret_raw)
+            llm_score = round(regret_raw * 100 if regret_raw <= 1 else regret_raw)
+
+            # Blend: 40% rule (catches structural issues) + 60% LLM (outfit graph)
+            final_score = round(rule_score * 0.40 + llm_score * 0.60)
+
+            # Convert LLM signal objects → readable human strings
+            raw_reasons = v.get("reasons") or []
+            if raw_reasons and isinstance(raw_reasons[0], dict):
+                # LLM returns list of signal dicts — extract the explanations
+                # for signals that support removal only (ignore keep signals)
+                reasons = [
+                    sig["explanation"]
+                    for sig in raw_reasons
+                    if isinstance(sig, dict)
+                    and sig.get("direction") == "supports_removal"
+                    and sig.get("score_contribution", 0) > 0
+                ] or rule_reasons
+            else:
+                reasons = raw_reasons or rule_reasons
+
+            outfit_count = int(v.get("outfits_affected") or v.get("outfit_count") or 0)
+            logger.debug(
+                "Removal %s: rule=%d llm=%d final=%d",
+                g.id, rule_score, llm_score, final_score,
             )
-            risk_final = round(regret_risk * 100 if regret_risk <= 1 else regret_risk)
-            logger.debug("LLM smart-removal %s: verdict=%s regret=%.2f", g.id, verdict_label, regret_risk)
         else:
-            # Rule-based fallback for this garment
-            reasons = []
-            if g.times_worn == 0:
-                reasons.append("Never worn")
-            elif g.times_worn <= p["low_use_threshold"]:
-                reasons.append(f"Worn only {g.times_worn} time(s)")
-            if len(g.seasons or []) <= 1:
-                reasons.append("Single season only")
-            if g.confidence < _CONFIDENCE_CAPSULE_MIN:
-                reasons.append("Low style match")
-            outfit_count = random.randint(0, 6)
-            removal_impact = "safe" if outfit_count == 0 else "low" if outfit_count <= 2 else "medium"
-            risk_final = min(base_risk, 100)
+            # Pure rule-based — already differentiated
+            final_score = rule_score
+            reasons = rule_reasons
+            # Estimate outfit_count from wardrobe size and category
+            cat_count = sum(1 for i in items if i.category == cat)
+            outfit_count = max(0, cat_count - 1) * 2   # conservative heuristic
+
+        removal_impact = (
+            "safe"   if outfit_count == 0
+            else "low"    if outfit_count <= 2
+            else "medium" if outfit_count <= 5
+            else "high"
+        )
 
         candidates.append({
-            "garment": garment_db_to_schema(g).model_dump(),
-            "risk_score": risk_final,
+            "garment": garment_db_to_schema(g).model_dump(mode="json"),
+            "risk_score": min(final_score, 100),
             "reasons": reasons,
             "outfit_count": outfit_count,
             "removal_impact": removal_impact,
@@ -1172,7 +1824,8 @@ def get_smart_removal(user_id: str, profile: str = "balanced") -> dict:
         "target_count": p["max_items"],
         "summary": (
             f"{len(candidates)} item(s) identified as low-impact — "
-            f"removing them would bring your wardrobe to {max(len(items) - len(candidates), 0)} core pieces."
+            f"removing them would bring your wardrobe to "
+            f"{max(len(items) - len(candidates), 0)} core pieces."
         ),
     }
 
@@ -1855,3 +2508,468 @@ def get_wardrobe_insights(user_id: str, refresh: bool = False) -> WardrobeInsigh
 def invalidate_insights_cache(user_id: str) -> None:
     """Deprecated alias for mark_wardrobe_dirty — kept for backward compatibility."""
     mark_wardrobe_dirty(user_id)
+
+
+# ─── Travel Capsule — proxy to LLM_project ───────────────────────────────────
+# The selection algorithm and all configuration now live in LLM_project.
+# This backend only:
+#   1. Fetches the user's garments from the DB
+#   2. Serialises them to plain dicts (no image bytes to keep payload small)
+#   3. POSTs to LLM_project via the shared llm_client (reads LLM_API_URL from .env)
+#   4. Returns the response verbatim to the mobile client
+
+
+async def get_travel_capsule_proxy(request) -> Dict:
+    """
+    Build a travel capsule by delegating to the LLM_project capsule service.
+
+    Steps:
+      1. Load garments from DB
+      2. Strip image bytes (keep attributes, metadata only)
+      3. Call POST /api/v1/capsule/travel via llm_client._async_client()
+         (URL comes from settings.llm_api_url / LLM_API_URL in .env — same as
+         every other LLM_project call in this backend)
+      4. Return TravelCapsuleResponse to the caller
+    """
+    import httpx
+    from models.schemas import TravelCapsuleResponse
+
+    # 1. Load wardrobe
+    with get_db_context() as db:
+        rows = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == request.user_id).all()
+    items = [garment_db_to_schema(row) for row in rows]
+
+    if not items:
+        raise HTTPException(status_code=404, detail="No garments in wardrobe")
+
+    # 2. Serialise — drop image_base64, serialise datetimes to ISO strings
+    def _slim(g: GarmentItem) -> Dict:
+        # mode="json" converts datetime → ISO string, UUID → str, etc.
+        d = g.model_dump(mode="json")
+        d.pop("image_base64", None)
+        return d
+
+    garments_payload = [_slim(g) for g in items]
+
+    # 3. Proxy via the shared llm_client (same URL config used everywhere)
+    body = {
+        "request": request.model_dump(mode="json"),
+        "garments": garments_payload,
+    }
+
+    try:
+        async with _llm._async_client() as client:
+            resp = await client.post("/api/v1/capsule/travel", json=body)
+    except RuntimeError as exc:
+        # LLM_API_URL not configured in .env
+        raise HTTPException(status_code=503, detail=str(exc))
+    except httpx.ConnectError as exc:
+        base = _llm._base_url()
+        logger.error("LLM_project unreachable at %s: %s", base, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Capsule service unavailable — LLM_project not reachable ({base}). "
+                   "Check LLM_API_URL in .env and ensure LLM_project is running.",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Capsule service timed out")
+
+    if resp.status_code != 200:
+        logger.error("Capsule service error %s: %s", resp.status_code, resp.text[:300])
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", resp.text))
+
+    return TravelCapsuleResponse(**resp.json())
+
+
+# ─── Legacy inline capsule helpers (kept for reference — no longer called) ───
+
+# Material practicality table — no LLM needed
+_MATERIAL_PRACTICALITY: Dict[str, float] = {
+    "jersey":    1.00,
+    "bamboo":    0.95,
+    "linen":     0.90,
+    "merino":    0.85,
+    "cotton":    0.80,
+    "denim":     0.75,
+    "polyester": 0.70,
+    "wool":      0.60,
+    "silk":      0.40,
+    "leather":   0.35,
+}
+
+# Climate → accepted seasons mapping
+_CLIMATE_SEASONS: Dict[str, List[str]] = {
+    "warm":  ["summer", "spring"],
+    "cold":  ["winter", "autumn"],
+    "mixed": ["summer", "spring", "winter", "autumn"],
+}
+
+# Neutral hex families (R, G, B centre)
+_NEUTRAL_FAMILIES = [
+    ("White",    (255, 255, 255)),
+    ("Off-White",(250, 250, 249)),
+    ("Nude",     (237, 232, 226)),
+    ("Stone",    (158, 148, 144)),
+    ("Charcoal", (58,  54,  51)),
+    ("Navy",     (27,  42,  74)),
+    ("Camel",    (193, 154, 107)),
+    ("Black",    (0,   0,   0)),
+]
+
+# Formality compatibility tiers
+_FORMALITY_TIERS: Dict[str, int] = {
+    "casual":        0,
+    "smart_casual":  1,
+    "business":      2,
+    "formal":        3,
+    "evening":       3,
+}
+
+# Occasion → required formality types
+_OCCASION_FORMALITIES: Dict[str, List[str]] = {
+    "travel":      ["casual", "smart_casual"],
+    "work_trip":   ["smart_casual", "business"],
+    "weekend":     ["casual"],
+    "city_break":  ["casual", "smart_casual"],
+    "beach":       ["casual"],
+    "date_night":  ["smart_casual", "formal"],
+}
+
+# Garment role assignment by category
+_CATEGORY_ROLES: Dict[str, str] = {
+    "top":       "anchor",
+    "dress":     "anchor",
+    "bottom":    "anchor",
+    "outerwear": "layer",
+    "shoes":     "shoes",
+    "accessory": "accent",
+}
+
+# Ideal template per occasion: {category: count}
+_OCCASION_TEMPLATE: Dict[str, Dict[str, int]] = {
+    "travel":     {"top": 3, "bottom": 2, "dress": 1, "outerwear": 1, "shoes": 1, "accessory": 1},
+    "work_trip":  {"top": 2, "bottom": 1, "dress": 1, "outerwear": 1, "shoes": 2},
+    "weekend":    {"top": 3, "bottom": 2, "shoes": 1},
+    "city_break": {"top": 2, "bottom": 2, "outerwear": 1, "shoes": 1},
+    "beach":      {"top": 2, "bottom": 1, "dress": 1, "shoes": 1},
+    "date_night": {"top": 1, "bottom": 1, "shoes": 1, "accessory": 1},
+}
+
+
+def _hex_to_rgb(hex_str: str) -> tuple:
+    h = hex_str.lstrip("#")
+    if len(h) != 6:
+        return (200, 190, 185)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return (200, 190, 185)
+
+
+def _nearest_neutral(hex_str: str) -> str:
+    r, g, b = _hex_to_rgb(hex_str)
+    best_name, best_dist = "Neutral", float("inf")
+    for name, (cr, cg, cb) in _NEUTRAL_FAMILIES:
+        dist = ((r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
+
+
+def _mat_score(material: Optional[str]) -> float:
+    if not material:
+        return 0.65
+    m = material.lower().strip()
+    for key, score in _MATERIAL_PRACTICALITY.items():
+        if key in m:
+            return score
+    return 0.65
+
+
+def _form_tier(formality: Optional[str]) -> int:
+    if not formality:
+        return 0
+    return _FORMALITY_TIERS.get(formality.lower().replace(" ", "_"), 1)
+
+
+def _garment_cat(g) -> str:
+    cat = g.attributes.category
+    return cat.value if hasattr(cat, "value") else str(cat)
+
+
+def _count_valid_outfits_capsule(garments: List, occasion_types: List[str]) -> int:
+    """Count valid outfit combos from a capsule garment list."""
+    from itertools import product as iproduct
+
+    tops      = [g for g in garments if _garment_cat(g) in ("top",)]
+    bottoms   = [g for g in garments if _garment_cat(g) == "bottom"]
+    dresses   = [g for g in garments if _garment_cat(g) == "dress"]
+    outerw    = [g for g in garments if _garment_cat(g) == "outerwear"]
+    shoes_lst = [g for g in garments if _garment_cat(g) == "shoes"]
+
+    target_tiers = {_form_tier(f) for f in occasion_types}
+    accepted_tiers = set()
+    for t in target_tiers:
+        accepted_tiers |= {max(0, t - 1), t, min(3, t + 1)}
+
+    shoe_mult = max(1, len(shoes_lst))
+    count = 0
+
+    for top in tops:
+        for bottom in bottoms:
+            if abs(_form_tier(top.attributes.formality) - _form_tier(bottom.attributes.formality)) > 1:
+                continue
+            avg_tier = (_form_tier(top.attributes.formality) + _form_tier(bottom.attributes.formality)) // 2
+            if avg_tier not in accepted_tiers:
+                continue
+            base = 1 + len(outerw)
+            count += base * shoe_mult
+
+    for dress in dresses:
+        if _form_tier(dress.attributes.formality) not in accepted_tiers:
+            continue
+        base = 1 + len(outerw)
+        count += base * shoe_mult
+
+    return count
+
+
+def _score_capsule(garments: List, occasion_types: List[str], max_pieces: int) -> Dict:
+    n = len(garments)
+    if n == 0:
+        return {"total_score": 0.0, "valid_combinations": 0,
+                "color_palette": [], "color_names": [],
+                "occasion_coverage": {}, "practicality_score": 0.0}
+
+    outfit_count = _count_valid_outfits_capsule(garments, occasion_types)
+    n_target = 6 if max_pieces <= 5 else (10 if max_pieces <= 7 else 15)
+    comb_norm = min(1.0, outfit_count / n_target)
+
+    occ_coverage_map: Dict[str, float] = {}
+    for occ in occasion_types:
+        occ_tier = _form_tier(occ)
+        occ_items = [g for g in garments
+                     if abs(_form_tier(g.attributes.formality) - occ_tier) <= 1]
+        occ_coverage_map[occ] = min(1.0, len(occ_items) / max(2, max_pieces * 0.3))
+    occ_score = sum(occ_coverage_map.values()) / max(len(occasion_types), 1)
+
+    hex_values = [g.attributes.color_hex for g in garments if getattr(g.attributes, "color_hex", None)]
+    family_counts: Dict[str, int] = {}
+    for hx in hex_values:
+        fam = _nearest_neutral(hx)
+        family_counts[fam] = family_counts.get(fam, 0) + 1
+    total_colored = len(hex_values) or 1
+    top3 = sorted(family_counts.items(), key=lambda x: -x[1])[:3]
+    top3_total = sum(c for _, c in top3)
+    palette_variety = 1.0 if len(family_counts) <= 3 else 0.5
+    color_cohesion = min(1.0, (top3_total / total_colored) * 0.6 + palette_variety * 0.4)
+
+    palette_names = [fam for fam, _ in top3]
+    palette_hexes = []
+    for fam_name, _ in top3:
+        candidates_hex = [g.attributes.color_hex for g in garments
+                          if getattr(g.attributes, "color_hex", None)
+                          and _nearest_neutral(g.attributes.color_hex) == fam_name]
+        palette_hexes.append(candidates_hex[0] if candidates_hex else "#EDE8E2")
+
+    practicality_score = sum(_mat_score(g.attributes.material) for g in garments) / n
+
+    total_score = round(
+        0.40 * comb_norm * 100
+        + 0.25 * occ_score * 100
+        + 0.20 * color_cohesion * 100
+        + 0.15 * practicality_score * 100,
+        1,
+    )
+
+    return {
+        "total_score": total_score,
+        "valid_combinations": outfit_count,
+        "color_palette": palette_hexes,
+        "color_names": palette_names,
+        "occasion_coverage": {k: round(v, 2) for k, v in occ_coverage_map.items()},
+        "practicality_score": round(practicality_score, 2),
+    }
+
+
+def _build_capsule_group(garments: List, occasion_types: List[str], max_pieces: int):
+    from models.schemas import CapsuleGroup as CG, CapsuleGarmentEntry as CGE
+
+    scored = _score_capsule(garments, occasion_types, max_pieces)
+    base_count = scored["valid_combinations"]
+
+    entries = []
+    for g in garments:
+        without = [x for x in garments if x.id != g.id]
+        without_count = _count_valid_outfits_capsule(without, occasion_types)
+        contribution = max(0, base_count - without_count)
+        role = _CATEGORY_ROLES.get(_garment_cat(g), "anchor")
+        entries.append(CGE(
+            garment=g,
+            role=role,
+            outfit_contribution=contribution,
+        ))
+
+    total = len(garments)
+    occ_str = " & ".join(occasion_types) if occasion_types else "travel"
+    summary = (
+        f"{total} versatile pieces covering {scored['valid_combinations']} outfits "
+        f"across {occ_str}."
+    )
+
+    return CG(
+        garments=entries,
+        valid_combinations=scored["valid_combinations"],
+        color_palette=scored["color_palette"],
+        color_names=scored["color_names"],
+        occasion_coverage=scored["occasion_coverage"],
+        practicality_score=scored["practicality_score"],
+        total_score=scored["total_score"],
+        summary=summary,
+    )
+
+
+def get_travel_capsule(user_id: str, request) -> Dict:
+    """
+    Greedy capsule selector for travel / contextual occasions.
+    Pure rule-based — no LLM call needed.
+    Returns a TravelCapsuleResponse-compatible dict.
+    """
+    from models.schemas import TravelCapsuleResponse
+
+    # Load wardrobe
+    with get_db_context() as db:
+        rows = db.query(GarmentItemDB).filter(GarmentItemDB.user_id == user_id).all()
+    items = [garment_db_to_schema(row) for row in rows]
+
+    if not items:
+        raise HTTPException(status_code=404, detail="No garments in wardrobe")
+
+    occasion = request.occasion
+    climate = request.destination_climate
+    duration = request.duration_days
+    max_pieces = request.max_pieces
+    occasion_types = request.occasion_types or _OCCASION_FORMALITIES.get(occasion, ["casual"])
+
+    accepted_seasons = _CLIMATE_SEASONS.get(climate, _CLIMATE_SEASONS["mixed"])
+
+    # ── Step 1: Filter candidates ──────────────────────────────
+    candidates = []
+    for g in items:
+        conf = getattr(g.attributes, "confidence", 1.0) or 1.0
+        if conf < _CONFIDENCE_CAPSULE_MIN:
+            continue
+        seasons = g.attributes.seasons or []
+        if seasons and not any(s.lower() in accepted_seasons for s in seasons):
+            continue
+        if occasion == "beach":
+            mat = (g.attributes.material or "").lower()
+            if mat and not any(m in mat for m in ["linen", "cotton", "jersey", "bamboo", "polyester"]):
+                continue
+        candidates.append(g)
+
+    if not candidates:
+        candidates = list(items)
+
+    # ── Step 2: Sort candidates by versatility ─────────────────
+    def _vscore(g) -> float:
+        cat = _garment_cat(g)
+        base = {"top": 1.0, "dress": 0.95, "bottom": 0.9,
+                "outerwear": 0.7, "shoes": 0.6, "accessory": 0.4}.get(cat, 0.5)
+        seasons_bonus = len(g.attributes.seasons or []) / 4 * 0.1
+        return base + seasons_bonus + _mat_score(g.attributes.material) * 0.1
+
+    candidates_sorted = sorted(candidates, key=_vscore, reverse=True)
+
+    # ── Step 3: Category fill (priority seeding) ───────────────
+    selected: List = []
+    used_ids: set = set()
+    for cat_key in ["top", "bottom", "shoes", "dress", "outerwear", "accessory"]:
+        best = next((g for g in candidates_sorted if _garment_cat(g) == cat_key and g.id not in used_ids), None)
+        if best and len(selected) < max_pieces:
+            selected.append(best)
+            used_ids.add(best.id)
+
+    # ── Step 4: Greedy fill ────────────────────────────────────
+    for _ in range(max_pieces - len(selected)):
+        best_gain = -1
+        best_cand = None
+        current_count = _count_valid_outfits_capsule(selected, occasion_types)
+        for g in candidates_sorted:
+            if g.id in used_ids:
+                continue
+            new_count = _count_valid_outfits_capsule(selected + [g], occasion_types)
+            gain = new_count - current_count
+            if gain > best_gain:
+                best_gain = gain
+                best_cand = g
+        if best_cand is None:
+            break
+        selected.append(best_cand)
+        used_ids.add(best_cand.id)
+
+    # Short trips: filter heavy materials
+    if occasion == "travel" and duration <= 3:
+        heavy_filtered = [g for g in selected if _mat_score(g.attributes.material) >= 0.70]
+        if len(heavy_filtered) >= 4:
+            selected = heavy_filtered[:max_pieces]
+
+    # ── Step 5: Build groups ────────────────────────────────────
+    best_group = _build_capsule_group(selected, occasion_types, max_pieces)
+
+    alternatives = []
+
+    # Alt A — swap lowest-contribution piece
+    if len(selected) > 1 and best_group.garments:
+        min_entry = min(best_group.garments, key=lambda e: e.outfit_contribution)
+        min_id = min_entry.garment.id
+        alt_a_base = [g for g in selected if g.id != min_id]
+        replacement = next(
+            (g for g in candidates_sorted if g.id not in {x.id for x in alt_a_base + selected}), None
+        )
+        if replacement:
+            alt_a = _build_capsule_group(alt_a_base + [replacement], occasion_types, max_pieces)
+            alternatives.append(alt_a)
+
+    # Alt B — practicality-first
+    pract_sorted = sorted(selected, key=lambda g: _mat_score(g.attributes.material), reverse=True)
+    alt_b_garments = pract_sorted[:min(len(selected), max_pieces)]
+    if len(alt_b_garments) >= 3:
+        alt_b = _build_capsule_group(alt_b_garments, occasion_types, max_pieces)
+        alternatives.append(alt_b)
+
+    # Alt C — minimalist (6 pieces)
+    if len(selected) > 6:
+        alt_c = _build_capsule_group(selected[:6], occasion_types, max(6, max_pieces))
+        alternatives.append(alt_c)
+
+    # ── Step 6: Missing pieces ─────────────────────────────────
+    selected_cats = {_garment_cat(g) for g in selected}
+    template = _OCCASION_TEMPLATE.get(occasion, {"top": 2, "bottom": 2, "shoes": 1})
+    missing_pieces: List[str] = []
+    label_map = {
+        "top":       "Versatile top",
+        "bottom":    "Casual trousers or skirt",
+        "dress":     "Lightweight dress",
+        "outerwear": "Packable jacket",
+        "shoes":     "Comfortable walking shoes",
+        "accessory": "Lightweight scarf or belt",
+    }
+    for cat_need in template:
+        if cat_need not in selected_cats:
+            missing_pieces.append(label_map.get(cat_need, cat_need.capitalize()))
+
+    if climate == "cold" and "outerwear" not in selected_cats:
+        missing_pieces.append("Warm layer (coat or sweater)")
+    if climate == "warm" and not any("linen" in (g.attributes.material or "").lower() for g in selected):
+        missing_pieces.append("Breathable linen or cotton piece")
+
+    return TravelCapsuleResponse(
+        best_group=best_group,
+        alternative_groups=alternatives,
+        missing_pieces=list(dict.fromkeys(missing_pieces))[:5],
+        total_wardrobe_items=len(items),
+        pieces_selected=len(selected),
+        source="rule",
+    )

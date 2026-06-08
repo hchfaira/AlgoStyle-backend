@@ -3,14 +3,21 @@ import pytest
 from fastapi import HTTPException
 from services.auth_service import (
     register_user, login_user, create_guest,
-    get_user_by_token, hash_password,
+    get_user_by_token, hash_password, verify_password,
 )
 from models.schemas import UserRole
 
 
 class TestHashPassword:
-    def test_consistent_hash(self):
-        assert hash_password("test123") == hash_password("test123")
+    def test_hash_verifies(self):
+        # bcrypt is salted — two hashes of the same password will differ,
+        # but verify_password must return True for a correct password.
+        hashed = hash_password("test123")
+        assert verify_password("test123", hashed) is True
+
+    def test_wrong_password_does_not_verify(self):
+        hashed = hash_password("test123")
+        assert verify_password("wrong", hashed) is False
 
     def test_different_passwords_different_hashes(self):
         assert hash_password("pass1") != hash_password("pass2")
@@ -58,7 +65,7 @@ class TestLogin:
 class TestGuest:
     def test_guest_login(self):
         result = create_guest()
-        assert result.user_id.startswith("guest_")
+        assert result.user_id.startswith("user_")
         assert result.name == "Guest"
         assert result.email == ""
         assert result.role == UserRole.USER

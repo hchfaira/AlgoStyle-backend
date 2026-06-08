@@ -20,6 +20,11 @@ class TestHealthEndpoint:
         assert "AlgoStyle" in res.json()["message"]
 
 
+def _auth_header(token: str) -> dict:
+    """Helper: build Authorization header from a token."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 class TestAuthRoutes:
     def test_register_and_login(self):
         # Register
@@ -40,8 +45,8 @@ class TestAuthRoutes:
         })
         assert res.status_code == 200
 
-        # Get current user
-        res = client.get(f"/api/v1/auth/me?token={token}")
+        # Get current user via Authorization header
+        res = client.get("/api/v1/auth/me", headers=_auth_header(token))
         assert res.status_code == 200
 
     def test_register_duplicate_email(self):
@@ -67,32 +72,61 @@ class TestAuthRoutes:
         })
         assert res.status_code == 401
 
+    def test_me_without_token_returns_401(self):
+        res = client.get("/api/v1/auth/me")
+        assert res.status_code in (401, 403)  # HTTPBearer raises 403 when header missing
+
+    def test_logout(self):
+        from services.auth_service import register_user
+        result = register_user("logout@test.com", "pass", "User")
+        token = result.token
+        res = client.post("/api/v1/auth/logout", headers=_auth_header(token))
+        assert res.status_code == 200
+        # Token should no longer work
+        res = client.get("/api/v1/auth/me", headers=_auth_header(token))
+        assert res.status_code == 401
+
 
 class TestRecommendationRoutes:
     def test_get_recommendations(self):
+        from services.auth_service import register_user
+        result = register_user("rec@test.com", "pass", "Rec User")
+        token = result.token
         res = client.post("/api/v1/recommend/outfits", json={
             "occasion": "casual",
             "top_k": 3,
-        })
+        }, headers=_auth_header(token))
         assert res.status_code == 200
         data = res.json()
         assert len(data["outfits"]) == 3
         assert data["total_combinations"] > 0
 
     def test_recommendations_with_all_params(self):
+        from services.auth_service import register_user
+        result = register_user("rec2@test.com", "pass", "Rec User2")
+        token = result.token
         res = client.post("/api/v1/recommend/outfits", json={
             "occasion": "business",
             "scoring_profile": "minimalist",
             "top_k": 5,
-        })
+        }, headers=_auth_header(token))
         assert res.status_code == 200
         assert len(res.json()["outfits"]) == 5
 
 
 class TestChatRoutes:
-    def test_chat_flow(self):
+    def test_chat_flow(self, test_user_id):
+        # Get a real token for the test user
+        from services.auth_service import generate_token, _token_expiry
+        from db import get_db_context
+        from models.database import UserToken
+        token = generate_token()
+        with get_db_context() as db:
+            db.add(UserToken(user_id=test_user_id, token=token, expires_at=_token_expiry()))
+            db.commit()
+
         # Start session
-        res = client.post("/api/v1/chat/start-session?user_id=test_user")
+        res = client.post("/api/v1/chat/start-session", headers=_auth_header(token))
         assert res.status_code == 200
         sid = res.json()["session_id"]
 
@@ -100,62 +134,94 @@ class TestChatRoutes:
         res = client.post("/api/v1/chat/message", json={
             "session_id": sid,
             "message": "What should I wear?",
-        })
+        }, headers=_auth_header(token))
         assert res.status_code == 200
         assert res.json()["response"]
 
         # Get history
-        res = client.get(f"/api/v1/chat/history/{sid}")
+        res = client.get(f"/api/v1/chat/history/{sid}", headers=_auth_header(token))
         assert res.status_code == 200
         assert len(res.json()["messages"]) == 2
 
 
 class TestWardrobeRoutes:
-    def test_add_and_list_garments(self):
+    def test_add_and_list_garments(self, test_user_id):
+        from services.auth_service import generate_token, _token_expiry
+        from db import get_db_context
+        from models.database import UserToken
+        token = generate_token()
+        with get_db_context() as db:
+            db.add(UserToken(user_id=test_user_id, token=token, expires_at=_token_expiry()))
+            db.commit()
+
         # Add garment
-        res = client.post("/api/v1/wardrobe/items?user_id=test_user")
+        res = client.post("/api/v1/wardrobe/items", headers=_auth_header(token))
         assert res.status_code == 200
         garment_id = res.json()["id"]
 
         # List
-        res = client.get("/api/v1/wardrobe/items?user_id=test_user")
+        res = client.get("/api/v1/wardrobe/items", headers=_auth_header(token))
         assert res.status_code == 200
         assert len(res.json()) == 1
 
         # Delete
-        res = client.delete(f"/api/v1/wardrobe/items/{garment_id}?user_id=test_user")
+        res = client.delete(f"/api/v1/wardrobe/items/{garment_id}", headers=_auth_header(token))
         assert res.status_code == 200
 
-    def test_toggle_favorite(self):
-        res = client.post("/api/v1/wardrobe/items?user_id=test_user")
+    def test_toggle_favorite(self, test_user_id):
+        from services.auth_service import generate_token, _token_expiry
+        from db import get_db_context
+        from models.database import UserToken
+        token = generate_token()
+        with get_db_context() as db:
+            db.add(UserToken(user_id=test_user_id, token=token, expires_at=_token_expiry()))
+            db.commit()
+
+        res = client.post("/api/v1/wardrobe/items", headers=_auth_header(token))
         gid = res.json()["id"]
 
-        res = client.post(f"/api/v1/wardrobe/items/{gid}/favorite?user_id=test_user")
+        res = client.post(f"/api/v1/wardrobe/items/{gid}/favorite", headers=_auth_header(token))
         assert res.status_code == 200
         assert res.json()["is_favorite"] is True
 
-    def test_wardrobe_stats(self):
-        client.post("/api/v1/wardrobe/items?user_id=test_user")
-        res = client.get("/api/v1/wardrobe/stats?user_id=test_user")
+    def test_wardrobe_stats(self, test_user_id):
+        from services.auth_service import generate_token, _token_expiry
+        from db import get_db_context
+        from models.database import UserToken
+        token = generate_token()
+        with get_db_context() as db:
+            db.add(UserToken(user_id=test_user_id, token=token, expires_at=_token_expiry()))
+            db.commit()
+
+        client.post("/api/v1/wardrobe/items", headers=_auth_header(token))
+        res = client.get("/api/v1/wardrobe/stats", headers=_auth_header(token))
         assert res.status_code == 200
         assert res.json()["total_items"] == 1
 
 
 class TestOnboardingRoutes:
-    def test_profile_lifecycle(self):
+    def test_profile_lifecycle(self, test_user_id):
+        from services.auth_service import generate_token, _token_expiry
+        from db import get_db_context
+        from models.database import UserToken
+        token = generate_token()
+        with get_db_context() as db:
+            db.add(UserToken(user_id=test_user_id, token=token, expires_at=_token_expiry()))
+            db.commit()
+
         # Get blank
-        res = client.get("/api/v1/onboarding/profile/test_user")
+        res = client.get(f"/api/v1/onboarding/profile/{test_user_id}", headers=_auth_header(token))
         assert res.status_code == 200
         assert res.json()["is_onboarded"] is False
 
         # Update
-        res = client.put("/api/v1/onboarding/profile/test_user", json={
+        res = client.put(f"/api/v1/onboarding/profile/{test_user_id}", json={
             "height_cm": 180.0,
             "gender": "homme",
-        })
+        }, headers=_auth_header(token))
         assert res.status_code == 200
         assert res.json()["height_cm"] == 180.0
 
         # Complete
-        res = client.post("/api/v1/onboarding/complete/test_user")
+        res = client.post(f"/api/v1/onboarding/complete/{test_user_id}", headers=_auth_header(token))
         assert res.status_code == 200

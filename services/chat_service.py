@@ -1,13 +1,50 @@
 """
 Chat service — conversational style assistant logic.
-Uses PostgreSQL database for persistence.
+Uses PostgreSQL database for persistence and Google Gemini for AI responses.
 """
 import random
-from typing import List
+import logging
+from typing import List, Optional
+import google.generativeai as genai
 
 from models.schemas import ChatResponse
-from models.database import ChatSession
+from models.database import ChatSession, User, UserProfile as UserProfileDB, GarmentItem as GarmentDB
 from db import get_db_context
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+# Configure Gemini
+try:
+    genai.configure(api_key=settings.google_api_key)
+    GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
+    GEMINI_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"Gemini not configured: {e}")
+    GEMINI_AVAILABLE = False
+
+
+# ── System prompt for the AI Style Assistant ────────────────────────────────
+
+SYSTEM_PROMPT = """You are an expert AI style assistant for AlgoStyle, a personal wardrobe and fashion app. Your role is to help users:
+
+1. **Style Advice**: Provide personalized fashion recommendations based on their wardrobe, body type, coloring, and preferences
+2. **Outfit Creation**: Suggest outfit combinations from their existing wardrobe items
+3. **Shopping Guidance**: Recommend what pieces to add to complete their wardrobe
+4. **Trend Insights**: Share current fashion trends and how to adapt them to the user's style
+5. **Occasion Dressing**: Help them dress appropriately for specific events or weather
+6. **Color & Pattern Matching**: Guide them on complementary colors and pattern mixing
+
+**Your tone**: Friendly, encouraging, and knowledgeable — like a stylish friend who genuinely wants to help. Use emojis sparingly for warmth.
+
+**Keep responses**:
+- Concise (2-4 sentences typically)
+- Actionable and specific
+- Personalized when you have user context
+- Encouraging and positive
+
+**When you don't have specific user data** (wardrobe, profile, etc.), provide general style advice and suggest they complete their profile or add wardrobe items for more personalized recommendations.
+"""
 
 
 MOCK_RESPONSES = [
@@ -41,7 +78,7 @@ def process_message(session_id: str, message: str) -> ChatResponse:
         if not session:
             raise Exception("Session not found")
         
-        messages = session.messages if session.messages else []
+        messages = list(session.messages) if session.messages else []
         messages.append({"role": "user", "content": message})
         
         # V1: Mock response. Production: calls ConversationHandler / LLM

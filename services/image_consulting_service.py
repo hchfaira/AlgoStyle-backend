@@ -261,8 +261,9 @@ def _build_summary(
     skin_tone: Optional[str],
     undertone: Optional[str],
     contrast_level: Optional[str],
+    season_sub: Optional[str] = None,
 ) -> str:
-    season = _compute_season(undertone, contrast_level)
+    season = season_sub or _compute_season(undertone, contrast_level)
     parts = []
     if body_shape:
         parts.append(f"Your body shape is **{body_shape.replace('_', ' ').title()}**")
@@ -288,6 +289,13 @@ _MOCK_UNDERTONES = ["warm", "cool", "neutral"]
 _MOCK_HAIR_COLORS = ["dark_brown", "medium_brown", "light_brown", "black", "blonde", "auburn"]
 _MOCK_CONTRAST = ["low", "medium", "high"]
 _MOCK_FACE_SHAPES = ["oval", "round", "square", "heart", "diamond", "rectangle"]
+_MOCK_SEASON_SUBS = [
+    "Light Spring", "True Spring", "Warm Spring",
+    "True Autumn", "Deep Autumn", "Warm Autumn",
+    "Light Summer", "True Summer", "Cool Summer",
+    "True Winter", "Deep Winter", "Cool Winter",
+]
+_MOCK_CHROMAS = ["clear", "muted"]
 
 
 def _mock_result(
@@ -303,7 +311,23 @@ def _mock_result(
     hair_color = _MOCK_HAIR_COLORS[seed % len(_MOCK_HAIR_COLORS)]
     contrast_level = _MOCK_CONTRAST[seed % len(_MOCK_CONTRAST)]
     face_shape = _MOCK_FACE_SHAPES[seed % len(_MOCK_FACE_SHAPES)]
-    color_season = _compute_season(undertone, contrast_level)
+    season_sub = _MOCK_SEASON_SUBS[seed % len(_MOCK_SEASON_SUBS)]
+    chroma = _MOCK_CHROMAS[seed % len(_MOCK_CHROMAS)]
+    color_season = season_sub  # use the 12-season sub as the displayed season
+
+    # Mock body shape scores (primary gets ~0.55, secondary ~0.30, rest split)
+    all_shapes = ["hourglass", "pear", "inverted_triangle", "rectangle", "apple", "athletic"]
+    primary_idx = seed % len(all_shapes)
+    secondary_idx = (seed + 1) % len(all_shapes)
+    body_shape_scores = {}
+    for i, s in enumerate(all_shapes):
+        if i == primary_idx:
+            body_shape_scores[s] = 0.55
+        elif i == secondary_idx:
+            body_shape_scores[s] = 0.30
+        else:
+            body_shape_scores[s] = round(0.15 / max(len(all_shapes) - 2, 1), 3)
+    body_shape_secondary = all_shapes[secondary_idx]
 
     top_size, bottom_size = None, None
     if height_cm:
@@ -328,15 +352,20 @@ def _mock_result(
         contrast_level=contrast_level,
         visual_weight="medium",
         color_season=color_season,
+        season_sub=season_sub,
+        chroma=chroma,
+        season_confidence=0.72,
+        body_shape_secondary=body_shape_secondary,
+        body_shape_scores=body_shape_scores,
+        waist_hip_ratio=0.78,
         estimated_top_size=top_size,
         estimated_bottom_size=bottom_size,
         color_palette=_build_color_palette(undertone, skin_tone, contrast_level),
         body_shape_guidance=_build_body_guidance(body_shape),
         face_shape_guidance=_build_face_guidance(face_shape),
-        summary=_build_summary(body_shape, skin_tone, undertone, contrast_level),
+        summary=_build_summary(body_shape, skin_tone, undertone, contrast_level, season_sub),
         overall_confidence=0.72,
     )
-
 
 
 # ──────────────────────────────────────────────────────────────
@@ -367,7 +396,17 @@ async def _analyze_with_llm(
     contrast_level = profile.get("contrast_level")
     visual_weight  = profile.get("visual_weight")
 
-    color_season  = _compute_season(undertone, contrast_level)
+    # 12-season colour fields (from enhanced ColorAnalyzer)
+    season_sub         = profile.get("season_sub")
+    chroma             = profile.get("chroma")
+    season_confidence  = profile.get("season_confidence")
+
+    # Enhanced morphology fields (from enhanced BodyAnalyzer)
+    body_shape_secondary = profile.get("body_shape_secondary")
+    body_shape_scores    = profile.get("body_shape_scores")
+    waist_hip_ratio      = profile.get("waist_hip_ratio")
+
+    color_season  = season_sub or _compute_season(undertone, contrast_level)
     color_palette = _build_color_palette(undertone, skin_tone, contrast_level)
     body_guidance = _build_body_guidance(body_shape)
     face_guidance = _build_face_guidance(face_shape)
@@ -387,7 +426,7 @@ async def _analyze_with_llm(
         else:
             top_size = bottom_size = "XL / 42"
 
-    summary = _build_summary(body_shape, skin_tone, undertone, contrast_level)
+    summary = _build_summary(body_shape, skin_tone, undertone, contrast_level, season_sub)
 
     return ImageConsultingResult(
         user_id=user_id,
@@ -399,6 +438,12 @@ async def _analyze_with_llm(
         contrast_level=contrast_level,
         visual_weight=visual_weight,
         color_season=color_season,
+        season_sub=season_sub,
+        chroma=chroma,
+        season_confidence=season_confidence,
+        body_shape_secondary=body_shape_secondary,
+        body_shape_scores=body_shape_scores,
+        waist_hip_ratio=waist_hip_ratio,
         estimated_top_size=top_size,
         estimated_bottom_size=bottom_size,
         color_palette=color_palette,
@@ -453,6 +498,12 @@ async def analyze_image(
         db_result.contrast_level = result.contrast_level
         db_result.visual_weight = result.visual_weight
         db_result.color_season = result.color_season
+        db_result.season_sub = result.season_sub
+        db_result.chroma = result.chroma
+        db_result.season_confidence = result.season_confidence
+        db_result.body_shape_secondary = result.body_shape_secondary
+        db_result.body_shape_scores = result.body_shape_scores
+        db_result.waist_hip_ratio = result.waist_hip_ratio
         db_result.estimated_top_size = result.estimated_top_size
         db_result.estimated_bottom_size = result.estimated_bottom_size
         db_result.color_palette = result.color_palette.model_dump() if result.color_palette else None
@@ -485,6 +536,181 @@ async def analyze_image(
     return result
 
 
+# ──────────────────────────────────────────────────────────────
+#  Manual-entry analysis (no photo)
+# ──────────────────────────────────────────────────────────────
+
+_SKIN_TONE_CONTRAST = {
+    "very_light": "high",
+    "light": "medium",
+    "medium_light": "medium",
+    "medium": "medium",
+    "medium_dark": "medium",
+    "dark": "high",
+    "very_dark": "very_high",
+}
+
+_HAIR_COLOR_CONTRAST_BOOST = {
+    "black": 1,
+    "dark_brown": 1,
+    "platinum_blonde": 1,
+    "blonde": 0,
+    "light_brown": 0,
+    "medium_brown": 0,
+    "auburn": 0,
+    "red": 0,
+}
+
+
+def _estimate_contrast(skin_tone: str, hair_color: str) -> str:
+    """Estimate contrast level from skin tone + hair color."""
+    base = _SKIN_TONE_CONTRAST.get(skin_tone.lower(), "medium")
+    boost = _HAIR_COLOR_CONTRAST_BOOST.get(hair_color.lower(), 0)
+    levels = ["very_low", "low", "medium", "high", "very_high"]
+    idx = levels.index(base) if base in levels else 2
+    idx = min(idx + boost, len(levels) - 1)
+    return levels[idx]
+
+
+async def analyze_manual(
+    user_id: str,
+    sex: str,
+    age: int,
+    height_cm: Optional[float] = None,
+    weight_kg: Optional[float] = None,
+    body_shape: str = "rectangle",
+    skin_tone: str = "medium",
+    hair_color: str = "dark_brown",
+    undertone: str = "neutral",
+) -> ImageConsultingResult:
+    """Build Style DNA result from manually-entered attributes (no vision)."""
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+
+    contrast_level = _estimate_contrast(skin_tone, hair_color)
+    color_season = _compute_season(undertone, contrast_level)
+    face_shape = "oval"  # default when no photo
+
+    # Season sub — use a simple heuristic from the season
+    season_sub_map = {
+        "Spring": "True Spring",
+        "Autumn": "True Autumn",
+        "Summer": "True Summer",
+        "Winter": "True Winter",
+    }
+    season_sub = season_sub_map.get(color_season) if color_season else None
+    chroma = "clear" if contrast_level in ("high", "very_high") else "muted"
+
+    # Body shape scores
+    all_shapes = ["hourglass", "pear", "inverted_triangle", "rectangle", "apple", "athletic"]
+    body_shape_scores = {}
+    for s in all_shapes:
+        body_shape_scores[s] = 0.80 if s == body_shape.lower() else round(0.20 / max(len(all_shapes) - 1, 1), 3)
+    secondary_idx = (all_shapes.index(body_shape.lower()) + 1) % len(all_shapes) if body_shape.lower() in all_shapes else 0
+    body_shape_secondary = all_shapes[secondary_idx]
+
+    # Estimated sizes from height
+    top_size = bottom_size = None
+    if height_cm:
+        if height_cm < 158:
+            top_size = bottom_size = "XS / 34"
+        elif height_cm < 163:
+            top_size = bottom_size = "S / 36"
+        elif height_cm < 168:
+            top_size = bottom_size = "M / 38"
+        elif height_cm < 175:
+            top_size = bottom_size = "L / 40"
+        else:
+            top_size = bottom_size = "XL / 42"
+
+    color_palette = _build_color_palette(undertone, skin_tone, contrast_level)
+    body_guidance = _build_body_guidance(body_shape)
+    face_guidance = _build_face_guidance(face_shape)
+    summary = _build_summary(body_shape, skin_tone, undertone, contrast_level, season_sub)
+
+    result = ImageConsultingResult(
+        user_id=user_id,
+        body_shape=body_shape,
+        face_shape=face_shape,
+        skin_tone=skin_tone,
+        undertone=undertone,
+        hair_color=hair_color,
+        contrast_level=contrast_level,
+        visual_weight="medium",
+        color_season=color_season or season_sub or "True Summer",
+        season_sub=season_sub,
+        chroma=chroma,
+        season_confidence=0.65,
+        body_shape_secondary=body_shape_secondary,
+        body_shape_scores=body_shape_scores,
+        waist_hip_ratio=0.78,
+        estimated_top_size=top_size,
+        estimated_bottom_size=bottom_size,
+        color_palette=color_palette,
+        body_shape_guidance=body_guidance,
+        face_shape_guidance=face_guidance,
+        summary=summary,
+        overall_confidence=0.65,
+        analyzed_at=datetime.utcnow(),
+    )
+
+    # Persist result (same pattern as analyze_image)
+    with get_db_context() as db:
+        db_result = db.query(ImageConsultingResultDB).filter(
+            ImageConsultingResultDB.user_id == user_id
+        ).first()
+
+        if not db_result:
+            db_result = ImageConsultingResultDB(user_id=user_id)
+
+        db_result.body_shape = result.body_shape
+        db_result.face_shape = result.face_shape
+        db_result.skin_tone = result.skin_tone
+        db_result.undertone = result.undertone
+        db_result.hair_color = result.hair_color
+        db_result.contrast_level = result.contrast_level
+        db_result.visual_weight = result.visual_weight
+        db_result.color_season = result.color_season
+        db_result.season_sub = result.season_sub
+        db_result.chroma = result.chroma
+        db_result.season_confidence = result.season_confidence
+        db_result.body_shape_secondary = result.body_shape_secondary
+        db_result.body_shape_scores = result.body_shape_scores
+        db_result.waist_hip_ratio = result.waist_hip_ratio
+        db_result.estimated_top_size = result.estimated_top_size
+        db_result.estimated_bottom_size = result.estimated_bottom_size
+        db_result.color_palette = result.color_palette.model_dump() if result.color_palette else None
+        db_result.body_shape_guidance = result.body_shape_guidance.model_dump() if result.body_shape_guidance else None
+        db_result.face_shape_guidance = result.face_shape_guidance.model_dump() if result.face_shape_guidance else None
+        db_result.summary = result.summary
+        db_result.overall_confidence = result.overall_confidence
+        db_result.analyzed_at = result.analyzed_at
+
+        db.add(db_result)
+
+        # Update user profile
+        profile = db.query(UserProfileDB).filter(UserProfileDB.user_id == user_id).first()
+        if profile:
+            profile.body_shape = result.body_shape
+            profile.skin_tone = result.skin_tone
+            profile.undertone = result.undertone
+            profile.hair_color = result.hair_color
+            profile.contrast_level = result.contrast_level
+            profile.estimated_top_size = result.estimated_top_size
+            profile.estimated_bottom_size = result.estimated_bottom_size
+            if height_cm:
+                profile.height_cm = height_cm
+            if weight_kg:
+                profile.weight_kg = weight_kg
+
+        db.commit()
+
+    logger.info(f"Manual consulting complete for {user_id}: {result.body_shape} / {result.color_season}")
+    return result
+
+
 def get_cached_result(user_id: str) -> ImageConsultingResult:
     """Return the most recent cached image consulting result."""
     with get_db_context() as db:
@@ -503,6 +729,12 @@ def get_cached_result(user_id: str) -> ImageConsultingResult:
                 contrast_level=db_result.contrast_level,
                 visual_weight=db_result.visual_weight,
                 color_season=db_result.color_season,
+                season_sub=getattr(db_result, 'season_sub', None),
+                chroma=getattr(db_result, 'chroma', None),
+                season_confidence=getattr(db_result, 'season_confidence', None),
+                body_shape_secondary=getattr(db_result, 'body_shape_secondary', None),
+                body_shape_scores=getattr(db_result, 'body_shape_scores', None),
+                waist_hip_ratio=getattr(db_result, 'waist_hip_ratio', None),
                 estimated_top_size=db_result.estimated_top_size,
                 estimated_bottom_size=db_result.estimated_bottom_size,
                 color_palette=ColorPaletteRecommendation(**db_result.color_palette) if db_result.color_palette else None,

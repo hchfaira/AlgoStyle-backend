@@ -21,7 +21,10 @@ def _get_driver():
         from neo4j import GraphDatabase
         uri  = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
         user = os.getenv("NEO4J_USER",     "neo4j")
-        pwd  = os.getenv("NEO4J_PASSWORD", "neo4j_password_123")
+        pwd  = os.getenv("NEO4J_PASSWORD")
+        if not pwd:
+            logger.warning("⚠️  NEO4J_PASSWORD not set — Neo4j sync disabled")
+            return None
         _driver = GraphDatabase.driver(uri, auth=(user, pwd))
         _driver.verify_connectivity()
         logger.info("✅ Neo4j connected (%s)", uri)
@@ -114,3 +117,48 @@ def delete_garment(garment_id: str) -> None:
                 logger.debug("Neo4j: no Garment node found for %s (nothing to delete)", garment_id)
     except Exception as e:
         logger.warning("Neo4j delete_garment failed for %s: %s", garment_id, e)
+
+
+def create_compatibility_relations(
+    garment_id: str,
+    compatible_ids: list[tuple[str, float]],
+) -> None:
+    """
+    Create COMPATIBLE_WITH relationships in Neo4j between a garment
+    and its most compatible peers.
+
+    compatible_ids — list of (other_garment_id, score) tuples,
+                     score in [0, 1].  Typically the top-N from Layer 2.
+
+    Both garments must already exist as nodes (created via upsert_garment).
+    This is a fire-and-forget call: failures are logged and never propagate.
+    """
+    driver = _get_driver()
+    if not driver or not compatible_ids:
+        return
+    try:
+        with driver.session() as session:
+            for other_id, score in compatible_ids:
+                session.run(
+                    """
+                    MATCH (a:Garment {id: $gid}), (b:Garment {id: $oid})
+                    MERGE (a)-[r:COMPATIBLE_WITH]->(b)
+                    SET r.score      = $score,
+                        r.updated_at = datetime()
+                    MERGE (b)-[r2:COMPATIBLE_WITH]->(a)
+                    SET r2.score      = $score,
+                        r2.updated_at = datetime()
+                    """,
+                    gid=garment_id,
+                    oid=other_id,
+                    score=float(score),
+                )
+        logger.info(
+            "Neo4j: created %d COMPATIBLE_WITH relations for garment %s",
+            len(compatible_ids), garment_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Neo4j create_compatibility_relations failed for %s: %s",
+            garment_id, e,
+        )
